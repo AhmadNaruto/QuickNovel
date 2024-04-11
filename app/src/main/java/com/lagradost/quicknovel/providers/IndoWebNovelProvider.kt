@@ -36,13 +36,13 @@ class IndoWebNovelProvider : MainApi() {
     open suspend fun load(url: String): LoadResponse? {
         doc = app.get(url).document.selectFirst("series-flex")
         return LoadResponse(
-          url: String = url
-          name: String = doc.selectFirst("series-title span").text
-          author: String? = doc.select("series-infolist span").next().text
-          posterUrl: String? = doc.selectFirst(".series-thumb > img").attr("src")
-          rating: Int? = doc.attr("[itemProp=ratingValue]").text.toRate()
-          synopsis: String? = doc.selectFirst("series-synops > p").text.clean()
-          status: Int? = doc.selectFirst(".status").text.toStatus()
+          url: String = url,
+          name: String = doc.selectFirst("series-title span").text,
+          author: String? = doc.select("series-infolist span").next().text,
+          posterUrl: String? = doc.selectFirst(".series-thumb > img").attr("src"),
+          rating: Int? = doc.attr("[itemProp=ratingValue]").text.toRate(),
+          synopsis: String? = doc.selectFirst("series-synops > p").text.clean(),
+          status: Int? = doc.selectFirst(".status").text.toStatus(),
           // 0 = null - implemented but not found, 1 = Ongoing, 2 = Complete, 3 = Pause/HIATUS, 4 = Dropped
           apiName: String = this.apiName
           // related : List<SearchResponse>?
@@ -60,9 +60,9 @@ class IndoWebNovelProvider : MainApi() {
 fun getResponse (api, doc) {
   return doc.mapOrNull {
     SearchResponse (
-      apiName = api
-      name = doc.selectFirst("flexbox2-title").text
-      url = doc.selectFirst("a").attr("href")
+      apiName = api,
+      name = doc.selectFirst("flexbox2-title").text,
+      url = doc.selectFirst("a").attr("href"),
       posterUrl = selectFirst("flexbox2-thumb img").attr("src")
     )
   }
