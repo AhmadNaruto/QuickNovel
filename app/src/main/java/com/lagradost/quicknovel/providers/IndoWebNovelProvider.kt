@@ -7,7 +7,7 @@ import org.jsoup.Jsoup
 class IndoWebNovelProvider : MainApi() {
     override val name = "IndoWebNovel"
     override val lang = "id"
-    override val mainUrl = "https://indowebnovel.id/id/"
+    override val mainUrl = "https://indowebnovel.id/id"
     override val iconId = R.drawable.ic_indowebnovel
     override val mainCategories: List<Pair<String, String>> = listOf()
     override val orderBys: List<Pair<String, String>> = listOf()
