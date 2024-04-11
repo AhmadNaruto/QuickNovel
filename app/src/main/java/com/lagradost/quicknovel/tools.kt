@@ -59,12 +59,6 @@ fun String.toStatus(): Int {
 
 fun String.clean(): String {
     return this
-        .replace(Regex("[\\n\\t\\r]"), "")
-        .replace(Regex("[ ]{2,}"), " ")
-}
-
-fun String.synopsis(): String {
-    return this
         .replace(Regex("(\\. )"), ".\n\n")
         .replace(Regex("[\\t\\r]"), "")
         .replace(Regex("\\n{1}"), "\n\n")
