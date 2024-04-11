@@ -26,14 +26,14 @@ class IndoWebNovelProvider : MainApi() {
         return getResponse(this.apiName, doc)
     }
 
-    open suspend fun search(query: String): List<SearchResponse>? {
+    override suspend fun search(query: String): List<SearchResponse>? {
         doc = app.get("$mainUrl/?s=$query")
           .document
           .select(".flexbox2-item")
         return getResponse(this.apiName, doc)
     }
 
-    open suspend fun load(url: String): LoadResponse? {
+    override suspend fun load(url: String): LoadResponse? {
         doc = app.get(url).document.selectFirst("series-flex")
         return LoadResponse(
           url: String = url,
@@ -49,7 +49,7 @@ class IndoWebNovelProvider : MainApi() {
         )
     }
 
-    open suspend fun loadHtml(url: String): String? {
+    override suspend fun loadHtml(url: String): String? {
         return app.get(url)
           .document
           .selectFirst(".readersss")
