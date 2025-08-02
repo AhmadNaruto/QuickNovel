@@ -18,7 +18,6 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.view.animation.DecelerateInterpolator
 import android.widget.AbsListView
 import android.widget.ArrayAdapter
 import android.widget.FrameLayout
@@ -66,11 +65,13 @@ import com.lagradost.quicknovel.ui.TextConfig
 import com.lagradost.quicknovel.ui.TextVisualLine
 import com.lagradost.quicknovel.util.Coroutines.ioSafe
 import com.lagradost.quicknovel.util.SingleSelectionHelper.showBottomDialog
+import com.lagradost.quicknovel.util.SingleSelectionHelper.showDialog
 import com.lagradost.quicknovel.util.UIHelper.colorFromAttribute
 import com.lagradost.quicknovel.util.UIHelper.fixPaddingStatusbar
 import com.lagradost.quicknovel.util.UIHelper.getStatusBarHeight
 import com.lagradost.quicknovel.util.UIHelper.popupMenu
 import com.lagradost.quicknovel.util.UIHelper.systemFonts
+import com.lagradost.quicknovel.util.divCeil
 import com.lagradost.quicknovel.util.toPx
 import java.io.File
 import java.lang.Integer.max
@@ -363,12 +364,8 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             return
         }
 
-        // val bottomPadding = binding.realText.paddingTop
         val topY = getTopY()
         val bottomY = getBottomY()
-
-        // binding.tmpTtsStart.fixLine(getTopY())
-        //  binding.tmpTtsEnd.fixLine(getBottomY())
 
         viewModel.onScroll(
             ScrollVisibilityIndex(
@@ -385,43 +382,15 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 },
             )
         )
-
-        /*val desired = viewModel.desiredIndex
-
-        lines.firstOrNull {
-            it.startChar >= desired.char
-        }?.let { line ->
-            binding.tmpTtsStart.fixLine(line.top)
-            binding.tmpTtsEnd.fixLine(line.bottom)
-        }*/
-
     }
 
     fun onScroll() {
-        val lines = getAllLines()
-        postLines(lines)
-
-
-        /*val topY = getTopY()
-        val bottomY = getBottomY()
-
-        val visibility = ScrollVisibility(
-            firstVisible = transformIndexToScrollVisibilityItem(textLayoutManager.findFirstVisibleItemPosition()),
-            firstFullyVisible = transformIndexToScrollVisibilityItem(textLayoutManager.findFirstCompletelyVisibleItemPosition()),
-            lastVisible = transformIndexToScrollVisibilityItem(textLayoutManager.findLastVisibleItemPosition()),
-            lastFullyVisible = transformIndexToScrollVisibilityItem(textLayoutManager.findLastCompletelyVisibleItemPosition()),
-            screenTop = topY,
-            screenBottom = bottomY,
-            screenTopBar = binding.readToolbarHolder.height
-        )
-
-        viewModel.onScroll(textAdapter.getIndex(visibility))*/
+        postLines(getAllLines())
     }
 
     private var cachedChapter: List<SpanDisplay> = emptyList()
     private fun scrollToDesired() {
         val desired: ScrollIndex = viewModel.desiredIndex ?: return
-
         val adapterPosition =
             cachedChapter.indexOfFirst { display -> display.index == desired.index && display.innerIndex == desired.innerIndex }
         if (adapterPosition == -1) return
@@ -470,6 +439,11 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
     private fun updateTTSLine(line: TTSHelper.TTSLine?, depth: Int = 0) {
         // update the visual component
+        /*println("LINE: ${line?.speakOutMsg} =>")
+        line?.speakOutMsg?.codePoints()?.forEachOrdered {
+            println(">>" + String(intArrayOf(it), 0, 1) + "|" + it.toString())
+        }*/
+
         textAdapter.updateTTSLine(line)
         for (position in textLayoutManager.findFirstVisibleItemPosition()..textLayoutManager.findLastVisibleItemPosition()) {
             val viewHolder = binding.realText.findViewHolderForAdapterPosition(position)
@@ -586,13 +560,22 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
     }
 
     private fun postDesired(view: View) {
-
         val currentDesired = viewModel.desiredIndex
         view.post {
             viewModel.desiredIndex = currentDesired
             scrollToDesired()
             updateTTSLine(viewModel.ttsLine.value)
         }
+    }
+
+    override fun onResume() {
+        viewModel.resumedApp()
+        super.onResume()
+    }
+
+    override fun onPause() {
+        viewModel.leftApp()
+        super.onPause()
     }
 
     /*private fun pendingPost() {
@@ -692,7 +675,12 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             //     overscrollMaxTranslation * currentOverScrollValue //alpha = (1.0f - currentOverScrollValue.absoluteValue)
         }
 
-    @SuppressLint("ClickableViewAccessibility")
+    override fun onDestroy() {
+        viewModel.stopTTS()
+        super.onDestroy()
+    }
+
+    @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         CommonActivity.loadThemes(this)
@@ -715,7 +703,8 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 textSize = viewModel.textSize,
                 textFont = viewModel.textFont,
                 backgroundColor = viewModel.backgroundColor,
-                bionicReading = viewModel.bionicReading
+                bionicReading = viewModel.bionicReading,
+                isTextSelectable = viewModel.isTextSelectable
             ).also { config ->
                 updateOtherTextConfig(config)
             }
@@ -756,6 +745,12 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
         observe(viewModel.bionicReadingLive) { color ->
             if (textAdapter.changeBionicReading(color)) {
+                updateTextAdapterConfig()
+            }
+        }
+
+        observe(viewModel.isTextSelectableLive) { isTextSelectable ->
+            if (textAdapter.changeTextSelectable(isTextSelectable)) {
                 updateTextAdapterConfig()
             }
         }
@@ -827,7 +822,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             binding.readActionRotate.apply {
                 setOnClickListener {
                     popupMenu(
-                        items = OrientationType.values().map { it.prefValue to it.stringRes },
+                        items = OrientationType.entries.map { it.prefValue to it.stringRes },
                         selectedItemId = org.prefValue
                     ) {
                         viewModel.orientation = itemId
@@ -883,8 +878,25 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             }
         }
 
+        /*binding.readToolbar.setOnMenuItemClickListener {
+            TimePickerDialog(
+                binding.readToolbar.context,
+                { _, hourOfDay, minute -> println("TIME PICKED: $hourOfDay , $minute") },
+                Calendar.getInstance().get(Calendar.HOUR_OF_DAY),
+                Calendar.getInstance().get(Calendar.MINUTE),
+                true
+            )
+            true
+        }*/
+
         observe(viewModel.ttsStatus) { status ->
             val isTTSRunning = status != TTSHelper.TTSStatus.IsStopped
+
+            /*if (isTTSRunning) {
+                binding.readToolbar.inflateMenu(R.menu.sleep_timer)
+            } else {
+                binding.readToolbar.menu.clear()
+            }*/
 
             binding.readerBottomView.isGone = isTTSRunning
             binding.readerBottomViewTts.isVisible = isTTSRunning
@@ -910,24 +922,39 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         }
 
         observe(viewModel.bottomVisibility) { visibility ->
-            if (visibility)
+            if (visibility) {
                 showSystemUI()
-            else
+                // here we actually do not want to fix the tts bug, as it will cause a bad behavior
+                // when the text is very low
+            } else {
                 hideSystemUI()
+                // otherwise we have a shitty bug with tts locking range
+                binding.root.post {
+                    updateTTSLine(viewModel.ttsLine.value)
+                }
+            }
         }
 
+        var last: Resource<Boolean> = Resource.Loading() // very dirty
         observe(viewModel.loadingStatus) { loading ->
+            val different = last != loading
+            last = loading
             when (loading) {
                 is Resource.Success -> {
                     binding.readLoading.isVisible = false
                     binding.readFail.isVisible = false
 
                     binding.readNormalLayout.isVisible = true
-                    binding.readNormalLayout.alpha = 0.01f
 
-                    ObjectAnimator.ofFloat(binding.readNormalLayout, "alpha", 1f).apply {
-                        duration = 300
-                        start()
+                    if (different) {
+                        binding.readNormalLayout.alpha = 0.01f
+
+                        ObjectAnimator.ofFloat(binding.readNormalLayout, "alpha", 1f).apply {
+                            duration = 300
+                            start()
+                        }
+                    } else {
+                        binding.readNormalLayout.alpha = 1.0f
                     }
                 }
 
@@ -967,7 +994,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                         val translated = !canScrollVertically(-1) || !canScrollVertically(1)
                         if (translated) {
                             // * (maxScrollOver - currentOverScroll.absoluteValue))
-                            currentOverScroll += dy * 0.3f
+                            currentOverScroll += dy * 0.1f
                         }
 
                         // if we can scroll down then we cant translate down
@@ -1054,10 +1081,22 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         observe(viewModel.chapter) { chapter ->
             cachedChapter = chapter.data
             textAdapter.submitList(chapter.data) {
+                viewModel._loadingStatus.postValue(Resource.Success(true)) // submitList can take 500ms, very dirty :(
                 if (chapter.seekToDesired) {
                     scrollToDesired()
                 }
                 onScroll()
+            }
+        }
+
+        observeNullable(viewModel.ttsTimeRemaining) { time ->
+            if (time == null) {
+                binding.ttsStopTime.isVisible = false
+            } else {
+                binding.ttsStopTime.isVisible = true
+                binding.ttsStopTime.text =
+                    binding.ttsStopTime.context.getString(R.string.sleep_format_stop)
+                        .format(time.divCeil(60_000L))
             }
         }
 
@@ -1071,7 +1110,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
             binding.readReadingType.setText(viewModel.readerType.stringRes)
             binding.readReadingType.setOnLongClickListener {
-                it.popupMenu(items = listOf(1 to R.string.reset_value),selectedItemId = null) {
+                it.popupMenu(items = listOf(1 to R.string.reset_value), selectedItemId = null) {
                     if (itemId == 1) {
                         binding.readReadingType.setText(ReadingType.DEFAULT.stringRes)
                         viewModel.readerType = ReadingType.DEFAULT
@@ -1081,7 +1120,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             }
             binding.readReadingType.setOnClickListener {
                 it.popupMenu(
-                    items = ReadingType.values().map { v -> v.prefValue to v.stringRes },
+                    items = ReadingType.entries.map { v -> v.prefValue to v.stringRes },
                     selectedItemId = viewModel.readerType.prefValue
                 ) {
                     val set = ReadingType.fromSpinner(itemId)
@@ -1091,7 +1130,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             }
 
             binding.readSettingsTextSizeText.setOnClickListener {
-                it.popupMenu(items = listOf(1 to R.string.reset_value),selectedItemId = null) {
+                it.popupMenu(items = listOf(1 to R.string.reset_value), selectedItemId = null) {
                     if (itemId == 1) {
                         viewModel.textSize = DEF_FONT_SIZE
                         binding.readSettingsTextSize.progress =
@@ -1196,9 +1235,90 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 }
             }
 
+            binding.readMlTo.setOnClickListener { view ->
+                if (view == null) return@setOnClickListener
+                val context = view.context
+
+                val items = ReadActivityViewModel.MLSettings.list
+
+                context.showDialog(
+                    items.map {
+                        it.second
+                    },
+                    items.map { it.first }.indexOf(viewModel.mlToLanguage),
+                    context.getString(R.string.sleep_timer), false, {}
+                ) { index ->
+                    viewModel.mlToLanguage = items[index].first
+                    binding.readMlTo.text =
+                        ReadActivityViewModel.MLSettings.fromShortToDisplay(viewModel.mlToLanguage)
+                }
+            }
+
+            binding.readMlFrom.setOnClickListener { view ->
+                if (view == null) return@setOnClickListener
+                val context = view.context
+
+                val items = ReadActivityViewModel.MLSettings.list
+
+                context.showDialog(
+                    items.map {
+                        it.second
+                    },
+                    items.map { it.first }.indexOf(viewModel.mlFromLanguage),
+                    context.getString(R.string.sleep_timer), false, {}
+                ) { index ->
+                    viewModel.mlFromLanguage = items[index].first
+                    binding.readMlFrom.text =
+                        ReadActivityViewModel.MLSettings.fromShortToDisplay(viewModel.mlFromLanguage)
+                }
+            }
+
+            binding.readApplyTranslation.setOnClickListener { view ->
+                if (view == null) return@setOnClickListener
+                ioSafe {
+                    try {
+                        if (!viewModel.requireMLDownload()) {
+                            viewModel.applyMLSettings(true)
+                            runOnUiThread { bottomSheetDialog.dismiss() }
+
+                            return@ioSafe
+                        }
+                        runOnUiThread {
+                            val builder: AlertDialog.Builder =
+                                AlertDialog.Builder(view.context, R.style.AlertDialogCustom)
+                            builder.setTitle(R.string.download_ml)
+                            builder.setMessage(R.string.download_ml_long)
+                            builder.setPositiveButton(R.string.download) { _, _ ->
+                                viewModel.applyMLSettings(true)
+                                bottomSheetDialog.dismiss()
+                            }
+                            builder.setCancelable(true)
+                            builder.setNegativeButton(R.string.cancel) { _, _ -> }
+                            builder.show()
+                        }
+                    } catch (t: Throwable) {
+                        showToast(t.message ?: t.toString())
+                    }
+                }
+            }
+
+            binding.readMlTo.text =
+                ReadActivityViewModel.MLSettings.fromShortToDisplay(viewModel.mlToLanguage)
+            binding.readMlFrom.text =
+                ReadActivityViewModel.MLSettings.fromShortToDisplay(viewModel.mlFromLanguage)
+
+            val mlSettings = viewModel.mlSettings
+
+            if (mlSettings.isInvalid()) {
+                binding.readMlTitle.setText(R.string.google_translate)
+            } else {
+                binding.readMlTitle.text =
+                    "${binding.readMlTitle.context.getString(R.string.google_translate)} (${mlSettings.fromDisplay} -> ${mlSettings.toDisplay})"
+            }
+
             binding.readLanguage.setOnClickListener { _ ->
                 ioSafe {
-                    viewModel.ttsSession.requireTTS { tts ->
+                    viewModel.ttsSession.requireTTS({ tts ->
                         runOnUiThread {
                             val languages = mutableListOf<Locale?>(null).apply {
                                 addAll(tts.availableLanguages?.filterNotNull() ?: emptySet())
@@ -1214,7 +1334,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                                 viewModel.setTTSLanguage(languages.getOrNull(index))
                             }
                         }
-                    }
+                    }, action = { false })
                 }
             }
 
@@ -1238,9 +1358,35 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 return@setOnLongClickListener true
             }
 
+            binding.readSleepTimer.setOnClickListener { view ->
+                if (view == null) return@setOnClickListener
+                val context = view.context
+
+                val items =
+                    mutableListOf(
+                        context.getString(R.string.default_text) to 0L,
+                    )
+
+                for (i in 1L..120L) {
+                    items.add(
+                        context.getString(R.string.sleep_format).format(i.toInt()) to (i * 60000L)
+                    )
+                }
+
+                context.showDialog(
+                    items.map {
+                        it.first
+                    },
+                    items.map { it.second }.indexOf(viewModel.ttsTimer),
+                    context.getString(R.string.sleep_timer), false, {}
+                ) { index ->
+                    viewModel.ttsTimer = items[index].second
+                }
+            }
+
             binding.readVoice.setOnClickListener {
                 ioSafe {
-                    viewModel.ttsSession.requireTTS { tts ->
+                    viewModel.ttsSession.requireTTS({ tts ->
                         runOnUiThread {
                             val matchAgainst = tts.voice.locale.language
                             val voices = mutableListOf<Voice?>(null).apply {
@@ -1256,7 +1402,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                                 viewModel.setTTSVoice(voices.getOrNull(index))
                             }
                         }
-                    }
+                    }, action = { false })
                 }
             }
 
@@ -1275,6 +1421,11 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 readSettingsShowBionic.isChecked = viewModel.bionicReading
                 readSettingsShowBionic.setOnCheckedChangeListener { _, isChecked ->
                     viewModel.bionicReading = isChecked
+                }
+
+                readSettingsIsTextSelectable.isChecked = viewModel.isTextSelectable
+                readSettingsIsTextSelectable.setOnCheckedChangeListener { _, isChecked ->
+                    viewModel.isTextSelectable = isChecked
                 }
 
                 readSettingsLockTts.isChecked = viewModel.ttsLock

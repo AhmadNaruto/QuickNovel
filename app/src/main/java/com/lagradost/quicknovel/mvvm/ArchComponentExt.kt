@@ -1,12 +1,10 @@
 package com.lagradost.quicknovel.mvvm
 
 import android.util.Log
-import android.widget.Toast
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LiveData
 import com.bumptech.glide.load.HttpException
 import com.lagradost.quicknovel.BuildConfig
-import com.lagradost.quicknovel.CommonActivity.showToast
 import com.lagradost.quicknovel.ErrorLoadingException
 import kotlinx.coroutines.*
 import java.net.SocketTimeoutException
@@ -100,7 +98,16 @@ fun logError(throwable: Throwable) {
     Log.d("ApiError", "-------------------------------------------------------------------")
 }
 
-fun <T> normalSafeApiCall(apiCall: () -> T): T? {
+fun <T> safe(apiCall: () -> T): T? {
+    return try {
+        apiCall.invoke()
+    } catch (throwable: Throwable) {
+        logError(throwable)
+        return null
+    }
+}
+
+suspend fun <T> safeAsync(apiCall: suspend () -> T): T? {
     return try {
         apiCall.invoke()
     } catch (throwable: Throwable) {

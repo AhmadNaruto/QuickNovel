@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.res.Resources
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
-import android.graphics.drawable.Drawable
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
@@ -46,15 +45,16 @@ import com.lagradost.quicknovel.CommonActivity
 import com.lagradost.quicknovel.ui.UiImage
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.databinding.ImageLayoutBinding
-import com.lagradost.quicknovel.databinding.SingleImageBinding
 import com.lagradost.quicknovel.mvvm.logError
-import com.lagradost.quicknovel.util.UIHelper.setImage
 import io.noties.markwon.image.AsyncDrawable
 import jp.wasabeef.glide.transformations.BlurTransformation
 import java.io.File
 import java.text.CharacterIterator
 import java.text.StringCharacterIterator
+import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
+import kotlin.math.sign
+
 //import androidx.palette.graphics.Palette
 
 
@@ -63,14 +63,21 @@ val Float.toPx: Float get() = (this * Resources.getSystem().displayMetrics.densi
 val Int.toDp: Int get() = (this / Resources.getSystem().displayMetrics.density).toInt()
 val Float.toDp: Float get() = (this / Resources.getSystem().displayMetrics.density)
 
+fun Int.divCeil(other: Int): Int {
+    return this.floorDiv(other) + this.rem(other).sign.absoluteValue
+}
+
+fun Long.divCeil(other: Long): Long {
+    return this.floorDiv(other) + this.rem(other).sign.absoluteValue
+}
+
 object UIHelper {
     fun String?.html(): Spanned {
-        return getHtmlText(this ?: return "".toSpanned())
+        return getHtmlText(this?.trim()?.replace("\n","<br>") ?: return "".toSpanned())
     }
-
     private fun getHtmlText(text: String): Spanned {
         return try {
-            // I have no idea if this can throw any error, but I dont want to try
+            // I have no idea if this can throw any error, but I don't want to try
             HtmlCompat.fromHtml(
                 text, HtmlCompat.FROM_HTML_MODE_LEGACY
             )
@@ -417,7 +424,7 @@ object UIHelper {
         noinline initMenu: (Menu.() -> Unit)? = null,
         noinline onMenuItemClick: MenuItem.() -> Unit,
     ): PopupMenu {
-        val popup = PopupMenu(context, this, Gravity.NO_GRAVITY, R.attr.actionOverflowMenuStyle, 0)
+        val popup = PopupMenu(context, this, Gravity.NO_GRAVITY, androidx.appcompat.R.attr.actionOverflowMenuStyle, 0)
         popup.menuInflater.inflate(menuRes, popup.menu)
 
         if (initMenu != null) {
@@ -447,7 +454,7 @@ object UIHelper {
         noinline onMenuItemClick: MenuItem.() -> Unit,
     ): PopupMenu {
         val ctw = ContextThemeWrapper(context, R.style.PopupMenu)
-        val popup = PopupMenu(ctw, this, Gravity.NO_GRAVITY, R.attr.actionOverflowMenuStyle, 0)
+        val popup = PopupMenu(ctw, this, Gravity.NO_GRAVITY, androidx.appcompat.R.attr.actionOverflowMenuStyle, 0)
 
         items.forEach { (id, stringRes) ->
             popup.menu.add(0, id, 0, stringRes)
@@ -484,7 +491,7 @@ object UIHelper {
         noinline onMenuItemClick: MenuItem.() -> Unit,
     ): PopupMenu {
         val ctw = ContextThemeWrapper(context, R.style.PopupMenu)
-        val popup = PopupMenu(ctw, this, Gravity.NO_GRAVITY, R.attr.actionOverflowMenuStyle, 0)
+        val popup = PopupMenu(ctw, this, Gravity.NO_GRAVITY, androidx.appcompat.R.attr.actionOverflowMenuStyle, 0)
 
         items.forEach { (id, icon, stringRes) ->
             popup.menu.add(0, id, 0, stringRes).setIcon(icon)

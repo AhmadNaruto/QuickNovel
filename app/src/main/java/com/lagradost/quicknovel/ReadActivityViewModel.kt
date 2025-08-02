@@ -2,6 +2,7 @@ package com.lagradost.quicknovel
 
 import android.content.Context
 import android.content.Intent
+import android.content.res.Resources
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Rect
@@ -9,9 +10,13 @@ import android.graphics.drawable.Drawable
 import android.media.MediaPlayer
 import android.speech.tts.Voice
 import android.text.Spanned
+import android.util.Log
 import android.widget.Toast
 import androidx.annotation.WorkerThread
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toDrawable
+import androidx.core.text.getSpans
+import androidx.core.text.toSpanned
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
@@ -19,7 +24,14 @@ import com.bumptech.glide.Glide
 import com.bumptech.glide.RequestBuilder
 import com.bumptech.glide.load.model.GlideUrl
 import com.bumptech.glide.request.target.Target
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.TranslatorOptions
 import com.lagradost.quicknovel.BaseApplication.Companion.context
 import com.lagradost.quicknovel.BaseApplication.Companion.getKey
 import com.lagradost.quicknovel.BaseApplication.Companion.getKeyClass
@@ -27,6 +39,7 @@ import com.lagradost.quicknovel.BaseApplication.Companion.removeKey
 import com.lagradost.quicknovel.BaseApplication.Companion.setKey
 import com.lagradost.quicknovel.BaseApplication.Companion.setKeyClass
 import com.lagradost.quicknovel.BookDownloader2Helper.getQuickChapter
+import com.lagradost.quicknovel.CommonActivity.TAG
 import com.lagradost.quicknovel.CommonActivity.activity
 import com.lagradost.quicknovel.CommonActivity.showToast
 import com.lagradost.quicknovel.TTSHelper.parseTextToSpans
@@ -36,7 +49,9 @@ import com.lagradost.quicknovel.mvvm.Resource
 import com.lagradost.quicknovel.mvvm.letInner
 import com.lagradost.quicknovel.mvvm.logError
 import com.lagradost.quicknovel.mvvm.map
+import com.lagradost.quicknovel.mvvm.safe
 import com.lagradost.quicknovel.mvvm.safeApiCall
+import com.lagradost.quicknovel.mvvm.safeAsync
 import com.lagradost.quicknovel.providers.RedditProvider
 import com.lagradost.quicknovel.ui.OrientationType
 import com.lagradost.quicknovel.ui.ReadingType
@@ -49,26 +64,38 @@ import com.lagradost.quicknovel.ui.txt
 import com.lagradost.quicknovel.util.Apis
 import com.lagradost.quicknovel.util.Coroutines.ioSafe
 import com.lagradost.quicknovel.util.Coroutines.runOnMainThread
+import com.lagradost.safefile.closeQuietly
 import io.noties.markwon.AbstractMarkwonPlugin
 import io.noties.markwon.Markwon
 import io.noties.markwon.MarkwonConfiguration
 import io.noties.markwon.SoftBreakAddsNewLinePlugin
 import io.noties.markwon.html.HtmlPlugin
 import io.noties.markwon.image.AsyncDrawable
+import io.noties.markwon.image.AsyncDrawableSpan
 import io.noties.markwon.image.ImageSizeResolver
 import io.noties.markwon.image.glide.GlideImagesPlugin
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import nl.siegmann.epublib.domain.Book
-import nl.siegmann.epublib.domain.TOCReference
-import nl.siegmann.epublib.epub.EpubReader
+import me.ag2s.epublib.domain.EpubBook
+import me.ag2s.epublib.domain.TOCReference
+import me.ag2s.epublib.epub.EpubReader
+import me.ag2s.epublib.util.zip.AndroidZipFile
 import org.commonmark.node.Node
 import org.jsoup.Jsoup
+import java.io.File
 import java.lang.ref.WeakReference
 import java.net.URLDecoder
+import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.reflect.KClass
 import kotlin.reflect.KProperty
 
@@ -141,6 +168,21 @@ abstract class AbstractBook {
     abstract fun getChapterTitle(index: Int): UiText
     abstract fun getLoadingStatus(index: Int): String?
 
+    @Throws
+    open fun loadImage(image: String): ByteArray? {
+        return null
+    }
+
+    fun loadImageBitmap(image: String): Bitmap? {
+        try {
+            val data = this.loadImage(image) ?: return null
+            return BitmapFactory.decodeByteArray(data, 0, data.size)
+        } catch (t: Throwable) {
+            logError(t)
+            return null
+        }
+    }
+
     @WorkerThread
     @Throws
     abstract suspend fun getChapterData(index: Int, reload: Boolean): String
@@ -164,11 +206,17 @@ abstract class AbstractBook {
     fun poster(): Bitmap? {
         return poster
     }
+
+    abstract fun author(): String?
 }
 
 class QuickBook(val data: QuickStreamData) : AbstractBook() {
     override fun resolveUrl(url: String): String {
         return Apis.getApiFromNameNull(data.meta.apiName)?.fixUrl(url) ?: url
+    }
+
+    override fun author(): String? {
+        return data.meta.author
     }
 
     override val canReload = true
@@ -238,7 +286,7 @@ class QuickBook(val data: QuickStreamData) : AbstractBook() {
     }
 }
 
-class RegularBook(val data: Book) : AbstractBook() {
+class RegularBook(val data: EpubBook) : AbstractBook() {
     init {
         var refs = mutableListOf<TOCReference>()
         data.tableOfContents.tocReferences.forEach { ref ->
@@ -251,6 +299,23 @@ class RegularBook(val data: Book) : AbstractBook() {
     }
 
     override val canReload = false
+    override fun author(): String? {
+        val mainAuthor = data.metadata.authors.firstOrNull() ?: return null
+        val firstName = mainAuthor.firstname
+        val lastName = mainAuthor.lastname ?: return firstName
+        if (firstName == null) {
+            return lastName
+        }
+        return "$firstName $lastName"
+    }
+
+    override fun loadImage(image: String): ByteArray? {
+        return data.resources.resourceMap.values.find { x ->
+            x.mediaType.name.contains("image") && image.endsWith(
+                x.href
+            )
+        }?.data
+    }
 
     override fun size(): Int {
         return data.tableOfContents.tocReferences.size
@@ -270,7 +335,25 @@ class RegularBook(val data: Book) : AbstractBook() {
     }
 
     override suspend fun getChapterData(index: Int, reload: Boolean): String {
-        return data.tableOfContents.tocReferences[index].resource.reader.readText()
+        val start = data.tableOfContents.tocReferences[index].resource
+        val startIdx = data.spine.getResourceIndex(start)
+
+        val end = data.tableOfContents.tocReferences.getOrNull(index + 1)?.resource
+        var endIdx = data.spine.getResourceIndex(end)
+        if (endIdx == -1) {
+            endIdx = data.spine.size()
+        }
+        val builder = StringBuilder()
+        for (i in startIdx until endIdx) {
+            val ref = data.spine.spineReferences[i]
+            // I have no idea, but nonlinear = stop?
+            if (!ref.isLinear && i != startIdx) {
+                break
+            }
+            builder.append(ref.resource.reader.readText())
+        }
+
+        return builder.toString()
     }
 
     override fun expand(last: String): Boolean {
@@ -284,15 +367,22 @@ class RegularBook(val data: Book) : AbstractBook() {
 
 data class LiveChapterData(
     val index: Int,
-    val render: Spanned,
-    val spans: List<SpanDisplay>,
+    /** Translated */
+    val spans: List<TextSpan>,
+    /** Translated */
+    val rendered: Spanned,
+    /** Non-Translated */
+    val originalRendered: Spanned,
+    /** Non-Translated */
+    val originalSpans: ArrayList<TextSpan>,
+
     val title: UiText,
     val rawText: String,
     //val ttsLines: List<TTSHelper.TTSLine>
 ) {
     // tts lines are lazy because not everyone uses tts
     val ttsLines by lazy {
-        ttsParseText(render.substring(0, render.length), index)
+        ttsParseText(rendered.substring(0, rendered.length), index)
     }
 }
 
@@ -302,20 +392,37 @@ data class ChapterUpdate(
 )
 
 class ReadActivityViewModel : ViewModel() {
-    private lateinit var book: AbstractBook
+    lateinit var book: AbstractBook
     private lateinit var markwon: Markwon
+    private var isInApp: Boolean = true
+    private var leftAppAt: ScrollIndex? = null
+    private var mlTranslator: com.google.mlkit.nl.translate.Translator? = null
+
+    fun leftApp() {
+        lastChangeIndex?.let { setScrollKeys(it) }
+        isInApp = false
+        leftAppAt = desiredIndex
+    }
+
+    fun resumedApp() {
+        val leftAt = leftAppAt
+        val resumeAt = desiredIndex
+
+        leftAppAt = null
+        isInApp = false
+
+        // if we resume the app and the desired index is different from what we are at currently
+        // then we scroll to it
+        if (leftAt != null && resumeAt != null && leftAt != resumeAt) {
+            scrollToDesired(resumeAt)
+        }
+    }
+
     //private lateinit var reducer: MarkwonReducer
 
     fun canReload(): Boolean {
         return book.canReload
     }
-
-    private var _context: WeakReference<ReadActivity2>? = null
-    var context
-        get() = _context?.get()
-        private set(value) {
-            _context = WeakReference(value)
-        }
 
 
     private val _chapterData: MutableLiveData<ChapterUpdate> =
@@ -323,7 +430,7 @@ class ReadActivityViewModel : ViewModel() {
     val chapter: LiveData<ChapterUpdate> = _chapterData
 
     // we use bool as we cant construct Nothing, does not represent anything
-    private val _loadingStatus: MutableLiveData<Resource<Boolean>> =
+    val _loadingStatus: MutableLiveData<Resource<Boolean>> =
         MutableLiveData<Resource<Boolean>>(null)
     val loadingStatus: LiveData<Resource<Boolean>> = _loadingStatus
 
@@ -408,7 +515,10 @@ class ReadActivityViewModel : ViewModel() {
 
     fun reloadChapter(index: Int) = ioSafe {
         hasExpanded.clear() // will unfuck the rest
-        loadIndividualChapter(index, reload = true, notify = false)
+        val notify = chapterMutex.withLock {
+            chapterData[index] is Resource.Failure
+        }
+        loadIndividualChapter(index, reload = true, notify = notify)
         updateReadArea(seekToDesired = false)
     }
 
@@ -418,11 +528,12 @@ class ReadActivityViewModel : ViewModel() {
 
     private suspend fun updateIndexAsync(
         index: Int,
-        notify: Boolean = true
+        notify: Boolean = true,
+        postLoading: Boolean = false,
     ) {
         for (idx in index - chapterPaddingBottom..index + chapterPaddingTop) {
             requested += index
-            loadIndividualChapter(idx, false, notify)
+            loadIndividualChapter(idx, reload = false, notify = notify, postLoading = postLoading)
         }
     }
 
@@ -562,17 +673,17 @@ class ReadActivityViewModel : ViewModel() {
     private suspend fun loadIndividualChapter(
         index: Int,
         reload: Boolean = false,
-        notify: Boolean = true
+        notify: Boolean = true,
+        reTranslate: Boolean = false,
+        postLoading: Boolean = false,
     ) {
         if (index < 0) return
 
         // set loading and return early if already loading or return cache
         chapterMutex.withLock {
             if (loading.contains(index)) return
-            if (!reload) {
-                if (chapterData.contains(index)) {
-                    return
-                }
+            if (!reload && !reTranslate && chapterData.contains(index)) {
+                return
             }
 
             loading += index
@@ -627,71 +738,335 @@ class ReadActivityViewModel : ViewModel() {
         }
 
         // load the data and precalculate everything needed
-        val data = safeApiCall {
-            book.getChapterData(index, reload)
-        }.map { text ->
-            val rawText = preParseHtml(text)
-            // val renderedBuilder = SpannableStringBuilder()
-            // val lengths : IntArray
-            //val nodes : Array<Node>
-            val rendered: Spanned
-            val parsed: Node
-            markwonMutex.withLock {
-                parsed = markwon.parse(rawText)
-                rendered = markwon.render(parsed)
+        try {
+            val data = safeApiCall {
+                book.getChapterData(index, reload)
+            }.map { text ->
+                val rawText = preParseHtml(text)
+                // val renderedBuilder = SpannableStringBuilder()
+                // val lengths : IntArray
+                //val nodes : Array<Node>
+                val parsed: Node
+                var rendered: Spanned
+                val originalRendered: Spanned
+                val originalSpans: ArrayList<TextSpan>
+                var spans: ArrayList<TextSpan>
 
-                //render(rawText, markwon)
-                // this was removed because the reducer did not work
-                /*val split = reducer.reduce(parsed)
-                val splitRendered = split.map { node ->
-                    markwon.render(node)
+                markwonMutex.withLock {
+                    parsed = markwon.parse(rawText)
+                    rendered = markwon.render(parsed)
+
+                    spans = parseTextToSpans(rendered, index)
+                    originalSpans = spans
+                    originalRendered = rendered
+
+                    val asyncDrawables = rendered.getSpans<AsyncDrawableSpan>()
+                    for (async in asyncDrawables) {
+                        async.drawable.result =
+                            book.loadImageBitmap(async.drawable.destination)?.toDrawable(
+                                Resources.getSystem()
+                            )
+                    }
+
+                    // translation may strip stuff, idk how to solve that in a clean way atm
+                    translate(
+                        rendered,
+                        spans
+                    ) { (progressChapter, progressInnerIndex, progressInnerTotal) ->
+                        val progressText =
+                            "Translating chapter $progressChapter ($progressInnerIndex/$progressInnerTotal)"
+                        if (postLoading) {
+                            _loadingStatus.postValue(Resource.Loading(progressText))
+                        } else {
+                            chapterMutex.withLock {
+                                chapterData[index] =
+                                    Resource.Loading(progressText)
+                                if (notify) notifyChapterUpdate(index)
+                            }
+                        }
+                    }.let { (mlRender, mlSpans) ->
+                        rendered = mlRender
+                        spans = mlSpans
+                    }
                 }
 
-                lengths = IntArray(splitRendered.size)
-                nodes = split.toTypedArray()
-
-                splitRendered.forEachIndexed { index, spanned ->
-                    renderedBuilder.append(spanned)
-                    lengths[index] = renderedBuilder.length
-                }*/
+                LiveChapterData(
+                    index = index,
+                    rendered = rendered,
+                    spans = spans,
+                    originalRendered = originalRendered,
+                    originalSpans = originalSpans,
+                    rawText = rawText,
+                    title = book.getChapterTitle(index),
+                )
             }
 
-            //val rendered = renderedBuilder.toSpannable()
-            LiveChapterData(
-                index = index,
-                render = rendered,
-                rawText = rawText,
-                spans = parseTextToSpans(rendered, index),
-                title = book.getChapterTitle(index),
-            )
+            // set the data and return
+            chapterMutex.withLock {
+                chapterData[index] = data
+            }
+        } catch (t: ErrorLoadingException) {
+            chapterMutex.withLock {
+                chapterData[index] = Resource.Failure(
+                    false,
+                    null,
+                    null,
+                    t.message ?: t.toString()
+                )
+            }
+        } catch (t: Throwable) {
+            // Tasks.await may throw
+            chapterMutex.withLock {
+                chapterData[index] = Resource.Failure(
+                    false,
+                    null,
+                    null,
+                    t.toString()
+                )
+            }
+        } finally {
+            chapterMutex.withLock {
+                loading -= index
+                if (notify) notifyChapterUpdate(index)
+            }
+        }
+    }
+
+    private fun hashString(text: ByteArray): String {
+        val digest = MessageDigest.getInstance("MD5").digest(text)
+        val sb = StringBuilder()
+        for (b in digest) {
+            sb.append(String.format("%02x", b))
+        }
+        return sb.toString()
+    }
+
+    @Throws
+    private suspend fun translate(
+        text: Spanned,
+        spans: ArrayList<TextSpan>,
+        loading: suspend (Triple<Int, Int, Int>) -> Unit
+    ): Pair<Spanned, ArrayList<TextSpan>> {
+        val translator = mlTranslator
+        val currentSettings = mlSettings
+        if (spans.isEmpty() || translator == null || currentSettings.isInvalid()) {
+            return text to spans
         }
 
-        // set the data and return
+        // the file
+        val filePrefix =
+            "ml_${
+                hashString(
+                    text.trim().toString().toByteArray()
+                )
+            }.${currentSettings.from}_to_${currentSettings.to}"
+
+        Log.i(TAG, "Translating $filePrefix")
+
+        // read from cache if it exists
+        // we assume that parseTextToSpans is equivalent from restoring from the builder
+        // aka out == parseTextToSpans(builder)
+        safe {
+            context?.cacheDir?.let {
+                val cache = File(it, "$filePrefix.txt")
+                if (cache.exists()) {
+                    Log.i(TAG, "Cache exists for $filePrefix")
+                    val mlText = cache.readText().toSpanned()
+                    return@safe mlText to parseTextToSpans(mlText, spans[0].index)
+                }
+            }
+            null
+        }?.let {
+            return it
+        }
+
+        try {
+            val builder = StringBuilder()
+            val out = ArrayList<TextSpan>()
+            for (span in spans) {
+                loading.invoke(Triple(span.index, span.innerIndex, spans.size))
+                val newText =
+                    Tasks.await(translator.translate(span.text.toString()))
+                val start = builder.length
+                builder.append(newText)
+                val end = builder.length
+                builder.append('\n')
+                out.add(TextSpan(newText.toSpanned(), start, end, span.index, span.innerIndex))
+            }
+
+            val mlRawText = builder.toString()
+
+            // atomically write the file
+            safe {
+                context?.cacheDir?.let {
+                    val cache = File(it, "$filePrefix.tmp")
+                    cache.writeText(mlRawText)
+                    cache.renameTo(File(it, "$filePrefix.txt"))
+                    Log.i(TAG, "Cached $filePrefix")
+                }
+            }
+
+            return mlRawText.toSpanned() to out
+        } catch (t: ExecutionException) {
+            throw t.cause ?: t
+        }
+    }
+
+    @Throws
+    suspend fun requireMLDownload(): Boolean {
+        val settings = MLSettings(from = mlFromLanguage, to = mlToLanguage)
+        if (settings.isInvalid()) {
+            return false
+        }
+        val modelManager = RemoteModelManager.getInstance()
+
+        for (model in arrayOf(settings.from, settings.to)) {
+            if (model == "en") continue
+
+            if (!Tasks.await(
+                    modelManager.isModelDownloaded(
+                        TranslateRemoteModel.Builder(model).build()
+                    )
+                )
+            ) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fun applyMLSettings(allowDownload: Boolean) = ioSafe {
+        val settings = MLSettings(from = mlFromLanguage, to = mlToLanguage)
+        if (settings.isValid() && allowDownload && safeAsync { requireMLDownload() } == true) {
+            _loadingStatus.postValue(Resource.Loading("Downloading language"))
+        }
+        initMLFromSettings(settings, allowDownload)
+        reloadMLForAllChapters()
+    }
+
+    private suspend fun reloadMLForAllChapters() {
+        _loadingStatus.postValue(Resource.Loading("Translating..."))
         chapterMutex.withLock {
-            chapterData[index] = data
-            loading -= index
-            if (notify) notifyChapterUpdate(index)
+            val cIndex = currentIndex
+            val lower = cIndex - chapterPaddingBottom
+            val upper = cIndex + chapterPaddingTop
+
+            val keys =
+                chapterData.keys.toTypedArray() // deep copy it to avoid ConcurrentModificationException
+
+            // remove all irrelevant cache so we do not translate outdated shit
+            for (key in keys) {
+                if (key < lower || key > upper) {
+                    chapterData.remove(key)
+                }
+            }
+
+            // update the rem cache
+            for (entry in chapterData.entries) {
+                val value = entry.value
+                if (value !is Resource.Success) continue
+                val success = value.value
+
+                try {
+                    translate(
+                        success.originalRendered,
+                        success.originalSpans
+                    ) { (progressChapter, progressInnerIndex, progressInnerTotal) ->
+                        _loadingStatus.postValue(Resource.Loading("Translating chapter $progressChapter ($progressInnerIndex/$progressInnerTotal)"))
+                    }.let { (mlRender, mlSpans) ->
+                        entry.setValue(
+                            Resource.Success(
+                                success.copy(
+                                    rendered = mlRender,
+                                    spans = mlSpans,
+                                )
+                            )
+                        )
+                    }
+                } catch (t: ErrorLoadingException) {
+                    entry.setValue(
+                        Resource.Failure(
+                            false,
+                            null,
+                            null,
+                            t.message ?: t.toString()
+                        )
+                    )
+                } catch (t: Throwable) {
+                    entry.setValue(
+                        Resource.Failure(
+                            false,
+                            null,
+                            null,
+                            t.toString()
+                        )
+                    )
+                }
+            }
+        }
+
+        // update what we have read
+        updateReadArea()
+
+        /*_loadingStatus.postValue(
+            Resource.Success(true)
+        )*/
+    }
+
+    private suspend fun initMLFromSettings(settings: MLSettings, allowDownload: Boolean) {
+        try {
+            mlTranslator?.closeQuietly()
+            mlTranslator = null
+
+            if (settings.isInvalid()) {
+                mlSettings = settings
+                return
+            }
+
+            val options = TranslatorOptions.Builder()
+                .setSourceLanguage(settings.from)
+                .setTargetLanguage(settings.to)
+                .build()
+
+            val translator = Translation.getClient(options)
+            mlTranslator = translator
+
+            if (allowDownload) {
+                Tasks.await(
+                    translator.downloadModelIfNeeded(), 60L, TimeUnit.SECONDS
+                )
+            }
+
+            mlSettings = settings
+        } catch (_: TimeoutException) {
+            showToast("Unable to download language")
+            mlTranslator?.closeQuietly()
+            mlTranslator = null
+        } catch (t: Throwable) {
+            logError(t)
         }
     }
 
     fun init(intent: Intent?, context: ReadActivity2) = ioSafe {
         _loadingStatus.postValue(Resource.Loading())
-        this@ReadActivityViewModel.context = context
         initTTSSession(context)
 
         val loadedBook = safeApiCall {
             if (intent == null) throw ErrorLoadingException("No intent")
 
             val data = intent.data ?: throw ErrorLoadingException("Empty intent")
-            val input = context.contentResolver.openInputStream(data)
-                ?: throw ErrorLoadingException("Empty data")
             val isFromEpub = intent.type != "quickstream"
 
             val epub = if (isFromEpub) {
-                val epubReader = EpubReader()
-                val book = epubReader.readEpub(input)
+                val fd = context.contentResolver.openFileDescriptor(data, "r")
+                    ?: throw ErrorLoadingException("Unable to open file descriptor")
+                val zipFile = AndroidZipFile(fd, "")
+                val book = EpubReader().readEpubLazy(zipFile, "utf-8")
                 RegularBook(book)
             } else {
+                val input = context.contentResolver.openInputStream(data)
+                    ?: throw ErrorLoadingException("Empty data")
                 QuickBook(DataStore.mapper.readValue(input.reader().readText()))
             }
 
@@ -705,18 +1080,32 @@ class ReadActivityViewModel : ViewModel() {
             is Resource.Success -> {
                 init(loadedBook.value, context)
 
-                // cant assume we know a chapter max as it can expand
-                val loadedChapter =
-                    maxOf(getKey(EPUB_CURRENT_POSITION, book.title()) ?: 0, 0)
+                initMLFromSettings(mlSettings, false)
 
+                // cant assume we know a chapter max as it can expand
+
+                val desiredChapterName = getKey<String>(EPUB_CURRENT_POSITION_CHAPTER, book.title())
+                val desiredChapterIndex =
+                    (0 until book.size()).firstOrNull {
+                        loadedBook.value.getChapterTitle(it)
+                            .asStringNull(context) == desiredChapterName
+                    } ?: getKey<Int>(EPUB_CURRENT_POSITION, book.title()) ?: 0
+                val loadedChapterIndex =
+                    maxOf(desiredChapterIndex, 0)
 
                 // we the current loaded thing here, but because loadedChapter can be >= book.size (expand) we have to check
-                if (loadedChapter < book.size()) {
-                    _loadingStatus.postValue(Resource.Loading(book.getLoadingStatus(loadedChapter)))
+                if (loadedChapterIndex < book.size()) {
+                    _loadingStatus.postValue(
+                        Resource.Loading(
+                            book.getLoadingStatus(
+                                loadedChapterIndex
+                            )
+                        )
+                    )
                 }
 
-                currentIndex = loadedChapter
-                updateIndexAsync(loadedChapter, notify = false)
+                currentIndex = loadedChapterIndex
+                updateIndexAsync(loadedChapterIndex, notify = false, postLoading = true)
 
                 if (book.size() <= 0) {
                     _loadingStatus.postValue(
@@ -724,17 +1113,17 @@ class ReadActivityViewModel : ViewModel() {
                             false,
                             null,
                             null,
-                            "Invalid chapter data when trying to load chapter $loadedChapter when the book only has ${book.size()} chapters"
+                            "Invalid chapter data when trying to load chapter $loadedChapterIndex when the book only has ${book.size()} chapters"
                         )
                     )
                     return@ioSafe
                 }
 
                 // if we are reading a book that sub/resize for some reason, this will clamp it into the correct range
-                if (loadedChapter >= book.size()) {
+                if (loadedChapterIndex >= book.size()) {
                     currentIndex = book.size() - 1
                     updateIndexAsync(currentIndex, notify = false)
-                    showToast("Resize $loadedChapter -> $currentIndex",  Toast.LENGTH_LONG)
+                    showToast("Resize $loadedChapterIndex -> $currentIndex", Toast.LENGTH_LONG)
                 }
 
                 val char = getKey(
@@ -749,9 +1138,9 @@ class ReadActivityViewModel : ViewModel() {
                 // notify once because initial load is 3 chapters I don't care about 10 notifications when the user cant see it
                 updateReadArea(seekToDesired = true)
 
-                _loadingStatus.postValue(
+                /*_loadingStatus.postValue(
                     Resource.Success(true)
-                )
+                )*/
             }
 
             is Resource.Failure -> {
@@ -782,6 +1171,7 @@ class ReadActivityViewModel : ViewModel() {
             .usePlugin(GlideImagesPlugin.create(object : GlideImagesPlugin.GlideStore {
                 override fun load(drawable: AsyncDrawable): RequestBuilder<Drawable> {
                     return try {
+
                         val newUrl = drawable.destination.substringAfter("&url=")
                         val url =
                             book.resolveUrl(
@@ -794,6 +1184,7 @@ class ReadActivityViewModel : ViewModel() {
 
                         Glide.with(context)
                             .load(GlideUrl(url) { mapOf("user-agent" to USER_AGENT) })
+
                     } catch (e: Exception) {
                         logError(e)
                         Glide.with(context)
@@ -838,10 +1229,10 @@ class ReadActivityViewModel : ViewModel() {
     private var _currentTTSStatus: TTSHelper.TTSStatus = TTSHelper.TTSStatus.IsStopped
     var currentTTSStatus: TTSHelper.TTSStatus
         get() = _currentTTSStatus
-        set(value) {
+        set(value) = synchronized(this@ReadActivityViewModel) {
             playDummySound()
             if (_currentTTSStatus == TTSHelper.TTSStatus.IsStopped && value == TTSHelper.TTSStatus.IsRunning) {
-                startTTSThread()
+                startTTSWorker()
             }
 
             _ttsStatus.postValue(value)
@@ -849,7 +1240,6 @@ class ReadActivityViewModel : ViewModel() {
         }
 
     fun stopTTS() {
-        if (!ttsSession.ttsInitalized()) return
         currentTTSStatus = TTSHelper.TTSStatus.IsStopped
     }
 
@@ -862,8 +1252,10 @@ class ReadActivityViewModel : ViewModel() {
     }
 
     fun pauseTTS() {
-        if (!ttsSession.ttsInitalized()) return
-        currentTTSStatus = TTSHelper.TTSStatus.IsPaused
+        if (!ttsSession.ttsInitialized()) return
+        if (currentTTSStatus == TTSHelper.TTSStatus.IsRunning) {
+            currentTTSStatus = TTSHelper.TTSStatus.IsPaused
+        }
     }
 
     fun startTTS() {
@@ -871,13 +1263,17 @@ class ReadActivityViewModel : ViewModel() {
     }
 
     fun forwardsTTS() {
-        if (!ttsSession.ttsInitalized()) return
+        if (!ttsSession.ttsInitialized()) return
         pendingTTSSkip += 1
     }
 
     fun backwardsTTS() {
-        if (!ttsSession.ttsInitalized()) return
+        if (!ttsSession.ttsInitialized()) return
         pendingTTSSkip -= 1
+    }
+
+    fun playTTS() {
+        currentTTSStatus = TTSHelper.TTSStatus.IsRunning
     }
 
     fun pausePlayTTS() {
@@ -894,136 +1290,193 @@ class ReadActivityViewModel : ViewModel() {
 
 
     private val ttsThreadMutex = Mutex()
-    private fun startTTSThread() = ioSafe {
-        val dIndex = desiredTTSIndex ?: desiredIndex ?: return@ioSafe
 
-        if (ttsThreadMutex.isLocked) return@ioSafe
-        ttsThreadMutex.withLock {
-            ttsSession.register()
+    fun startTTSWorker() = ioSafe {
+        TTSNotificationService.start(this@ReadActivityViewModel, context ?: return@ioSafe)
+    }
 
-            var innerIndex = 0
-            var index = dIndex.index
+    suspend fun startTTSThread() = coroutineScope {
+        try {
+            val ttsStartTime = System.currentTimeMillis()
+            var ttsEndTime = ttsStartTime + ttsTimer
+            val ttsHasTimer = ttsEndTime > ttsStartTime
 
-            let {
-                val startChar = dIndex.char
+            val dIndex = desiredTTSIndex ?: desiredIndex ?: return@coroutineScope
 
-                val lines = chapterMutex.withLock {
-                    chapterData[index].letInner {
-                        it.ttsLines
+            if (ttsThreadMutex.isLocked) return@coroutineScope
+            ttsThreadMutex.withLock {
+                ttsSession.register()
+
+                var ttsInnerIndex = 0 // this inner index is different from what is set
+                var index = dIndex.index
+
+                let {
+                    val startChar = dIndex.char
+
+                    val lines = chapterMutex.withLock {
+                        chapterData[index].letInner {
+                            it.ttsLines
+                        }
+                    } ?: run {
+                        // in case of error just go to the next chapter
+                        index++
+                        return@let
                     }
-                } ?: run {
-                    // in case of error just go to the next chapter
-                    index++
-                    return@let
+
+                    val idx = lines.indexOfFirst { it.startChar >= startChar }
+                    if (idx != -1)
+                        ttsInnerIndex = idx
                 }
+                while (isActive && currentTTSStatus != TTSHelper.TTSStatus.IsStopped) {
+                    val lines =
+                        when (val currentData =
+                            chapterMutex.withLock { chapterData[index] } ?: run {
+                                loadIndividualChapter(index)
+                                chapterMutex.withLock { chapterData[index] }
+                            }) {
+                            null -> {
+                                showToast("Got null data")
+                                break
+                            }
 
-                val idx = lines.indexOfFirst { it.startChar >= startChar }
-                if (idx != -1)
-                    innerIndex = idx
-            }
-            while (true) {
-                if (currentTTSStatus == TTSHelper.TTSStatus.IsStopped) break
-                val lines = when (val currentData = chapterMutex.withLock { chapterData[index] }) {
-                    null -> {
-                        showToast("Got null data")
-                        break
+                            is Resource.Failure -> {
+                                showToast(currentData.errorString)
+                                break
+                            }
+
+                            is Resource.Loading -> {
+                                if (currentTTSStatus == TTSHelper.TTSStatus.IsStopped) break
+                                delay(100)
+                                continue
+                            }
+
+                            is Resource.Success -> {
+                                currentData.value.ttsLines
+                            }
+                        }
+
+                    fun notify() {
+                        TTSNotifications.notify(
+                            book.title(),
+                            chaptersTitlesInternal[index],
+                            book.poster(),
+                            currentTTSStatus,
+                            context
+                        )
+                    }
+                    notify()
+
+                    // this is because if you go back one line you will be on the previous chapter with
+                    // a negative innerIndex, this makes the wrapping good
+                    if (ttsInnerIndex < 0) {
+                        ttsInnerIndex += lines.size
                     }
 
-                    is Resource.Failure -> {
-                        showToast(currentData.errorString)
-                        break
-                    }
+                    updateIndex(index)
 
-                    is Resource.Loading -> {
+                    // speak all lines
+                    while (ttsInnerIndex < lines.size && ttsInnerIndex >= 0) {
+                        ensureActive()
+
+                        // auto stop
+                        val currentTimeRemaining = ttsEndTime - System.currentTimeMillis()
+                        if (ttsHasTimer) {
+                            if (currentTimeRemaining < 0) {
+                                currentTTSStatus = TTSHelper.TTSStatus.IsStopped
+                            } else {
+                                ttsTimeRemaining.postValue(currentTimeRemaining)
+                            }
+                        }
+
                         if (currentTTSStatus == TTSHelper.TTSStatus.IsStopped) break
-                        delay(100)
-                        continue
+
+                        val line = lines[ttsInnerIndex]
+                        val nextLine = lines.getOrNull(ttsInnerIndex + 1)
+
+                        // set keys
+                        /*setKey(
+                            EPUB_CURRENT_POSITION_SCROLL_CHAR,
+                            book.title(),
+                            line.startChar
+                        )
+                        setKey(EPUB_CURRENT_POSITION, book.title(), line.index)*/
+
+                        // if we are outside the app, then we post new desired location
+                        // as otherwise the scroll overrides it
+                        // this is done to scroll to latest when we go back to the app
+                        if (!isInApp) {
+                            innerCharToIndex(index, line.startChar)?.let {
+                                changeIndex(
+                                    ScrollIndex(
+                                        index,
+                                        it,
+                                        line.startChar
+                                    ), alsoTitle = false
+                                )
+                            }
+                        }
+
+
+                        // post visual
+                        _ttsLine.postValue(line)
+
+                        // wait for next line
+                        val waitFor = ttsSession.speak(
+                            line,
+                            nextLine
+                        ) {
+                            currentTTSStatus != TTSHelper.TTSStatus.IsRunning || pendingTTSSkip != 0
+                        }
+                        ttsSession.waitForOr(waitFor, {
+                            currentTTSStatus != TTSHelper.TTSStatus.IsRunning || pendingTTSSkip != 0
+                        }) {
+                            notify()
+                        }
+
+                        // wait for pause
+                        var isPauseDuration = 0L
+                        while (currentTTSStatus == TTSHelper.TTSStatus.IsPaused) {
+                            isPauseDuration++
+                            delay(100)
+                        }
+
+                        // do not count in tts sleep
+                        ttsEndTime += 100L * isPauseDuration
+
+                        // if we pause then we resume on the same line
+                        if (isPauseDuration > 0) {
+                            notify()
+                            pendingTTSSkip = 0
+                            continue
+                        }
+
+                        if (pendingTTSSkip != 0) {
+                            ttsInnerIndex += pendingTTSSkip
+                            pendingTTSSkip = 0
+                        } else {
+                            ttsInnerIndex += 1
+                        }
                     }
-
-                    is Resource.Success -> {
-                        currentData.value.ttsLines
-                    }
-                }
-
-                fun notify() {
-                    TTSNotifications.notify(
-                        book.title(),
-                        chaptersTitlesInternal[index],
-                        book.poster(),
-                        currentTTSStatus,
-                        context
-                    )
-                }
-                notify()
-
-                // this is because if you go back one line you will be on the previous chapter with
-                // a negative innerIndex, this makes the wrapping good
-                if (innerIndex < 0) {
-                    innerIndex += lines.size
-                }
-
-                updateIndex(index)
-
-                // speak all lines
-                while (innerIndex < lines.size && innerIndex >= 0) {
                     if (currentTTSStatus == TTSHelper.TTSStatus.IsStopped) break
 
-                    val line = lines[innerIndex]
-                    val nextLine = lines.getOrNull(innerIndex + 1)
-
-                    // set keys
-                    setKey(
-                        EPUB_CURRENT_POSITION_SCROLL_CHAR,
-                        book.title(),
-                        line.startChar
-                    )
-                    setKey(EPUB_CURRENT_POSITION, book.title(), line.index)
-
-                    // post visual
-                    _ttsLine.postValue(line)
-
-                    // wait for next line
-                    val waitFor = ttsSession.speak(line, nextLine)
-                    ttsSession.waitForOr(waitFor, {
-                        currentTTSStatus != TTSHelper.TTSStatus.IsRunning || pendingTTSSkip != 0
-                    }) {
-                        notify()
-                    }
-
-                    // wait for pause
-                    var isPauseDuration = 0
-                    while (currentTTSStatus == TTSHelper.TTSStatus.IsPaused) {
-                        isPauseDuration++
-                        delay(100)
-                    }
-
-                    // if we pause then we resume on the same line
-                    if (isPauseDuration > 0) {
-                        notify()
-                        pendingTTSSkip = 0
-                        continue
-                    }
-
-                    if (pendingTTSSkip != 0) {
-                        innerIndex += pendingTTSSkip
-                        pendingTTSSkip = 0
+                    // this may case a bug where you cant seek back if the entire chapter is none
+                    // but this is better than restarting the chapter
+                    if (ttsInnerIndex > 0 || lines.size == 0) {
+                        // goto next chapter and set inner to 0
+                        index++
+                        ttsInnerIndex = 0
+                    } else if (index > 0) {
+                        index--
                     } else {
-                        innerIndex += 1
+                        ttsInnerIndex = 0
                     }
-                }
-                if (currentTTSStatus == TTSHelper.TTSStatus.IsStopped) break
-
-                if (innerIndex > 0) {
-                    // goto next chapter and set inner to 0
-                    index++
-                    innerIndex = 0
-                } else if (index > 0) {
-                    index--
-                } else {
-                    innerIndex = 0
                 }
             }
+        } catch (_: TimeoutCancellationException) {
 
+        } catch (t: Throwable) {
+            logError(t)
+        } finally {
             currentTTSStatus = TTSHelper.TTSStatus.IsStopped
             TTSNotifications.notify(
                 book.title(),
@@ -1032,8 +1485,10 @@ class ReadActivityViewModel : ViewModel() {
                 TTSHelper.TTSStatus.IsStopped,
                 context
             )
+            ttsSession.interruptTTS()
             ttsSession.unregister()
             _ttsLine.postValue(null)
+            ttsTimeRemaining.postValue(null)
         }
     }
 
@@ -1049,7 +1504,7 @@ class ReadActivityViewModel : ViewModel() {
             return false
         }
 
-        if (!ttsSession.ttsInitalized()) return false
+        if (!ttsSession.ttsInitialized()) return false
 
         when (input) {
             TTSHelper.TTSActionType.Pause -> pauseTTS()
@@ -1065,18 +1520,33 @@ class ReadActivityViewModel : ViewModel() {
         // the lock is so short it does not matter I *hope*
         return runBlocking {
             chapterMutex.withLock { chapterData[index] }?.letInner { live ->
+                // todo binary search, but strip all but TextSpan first
                 live.spans.firstOrNull { it is TextSpan && it.start >= char }?.innerIndex
             }
         }
     }
 
     /** sets the metadata and global vars used as well as keys */
-    private fun changeIndex(scrollIndex: ScrollIndex) {
-        _chapterTile.postValue(chaptersTitlesInternal[scrollIndex.index])
+    private var lastChangeIndex: ScrollIndex? = null
+    private var lastScrollMs: Long = 0
+    private fun changeIndex(scrollIndex: ScrollIndex, alsoTitle: Boolean = true) {
+        if (alsoTitle) {
+            _chapterTile.postValue(chaptersTitlesInternal[scrollIndex.index])
+        }
 
         desiredIndex = scrollIndex
         currentIndex = scrollIndex.index
 
+        // the majority of the time is spent on setKey, and because this is called from onscroll
+        // this fixes lag
+        lastChangeIndex = scrollIndex
+        if (System.currentTimeMillis() > lastScrollMs + 200L) {
+            lastScrollMs = System.currentTimeMillis()
+            setScrollKeys(scrollIndex)
+        }
+    }
+
+    private fun setScrollKeys(scrollIndex: ScrollIndex) {
         setKey(
             EPUB_CURRENT_POSITION_READ_AT,
             "${book.title()}/${scrollIndex.index}",
@@ -1089,6 +1559,13 @@ class ReadActivityViewModel : ViewModel() {
             scrollIndex.char
         )
         setKey(EPUB_CURRENT_POSITION, book.title(), scrollIndex.index)
+        context?.let {
+            setKey(
+                EPUB_CURRENT_POSITION_CHAPTER,
+                book.title(),
+                book.getChapterTitle(scrollIndex.index).asString(it)
+            )
+        }
     }
 
     fun scrollToDesired(scrollIndex: ScrollIndex) {
@@ -1110,7 +1587,6 @@ class ReadActivityViewModel : ViewModel() {
 
         // load the chapters
         updateIndexAsync(index, notify = false)
-
         // set the keys
         setKey(EPUB_CURRENT_POSITION, book.title(), index)
         setKey(EPUB_CURRENT_POSITION_SCROLL_CHAR, book.title(), 0)
@@ -1122,10 +1598,9 @@ class ReadActivityViewModel : ViewModel() {
 
         // push the update
         updateReadArea(seekToDesired = true)
-
         // update the view
         _chapterTile.postValue(chaptersTitlesInternal[index])
-        _loadingStatus.postValue(Resource.Success(true))
+        //_loadingStatus.postValue(Resource.Success(true))
     }
 
     /*private fun changeIndex(index: Int, updateArea: Boolean = true) {
@@ -1170,8 +1645,10 @@ class ReadActivityViewModel : ViewModel() {
     }
 
     override fun onCleared() {
+        lastChangeIndex?.let { setScrollKeys(it) }
         ttsSession.release()
-
+        mlTranslator?.close()
+        mlTranslator = null
         super.onCleared()
     }
 
@@ -1208,6 +1685,14 @@ class ReadActivityViewModel : ViewModel() {
         false,
         Boolean::class,
         bionicReadingLive
+    )
+
+    val isTextSelectableLive: MutableLiveData<Boolean> = MutableLiveData(null)
+    var isTextSelectable by PreferenceDelegateLiveView(
+        EPUB_TEXT_SELECTABLE,
+        false,
+        Boolean::class,
+        isTextSelectableLive
     )
 
     val orientationLive: MutableLiveData<Int> = MutableLiveData(null)
@@ -1262,4 +1747,141 @@ class ReadActivityViewModel : ViewModel() {
     var screenAwake by PreferenceDelegateLiveView(
         EPUB_KEEP_SCREEN_ACTIVE, true, Boolean::class, screenAwakeLive
     )
+
+    // in milliseconds
+    val ttsTimerLive: MutableLiveData<Long> = MutableLiveData(null)
+    var ttsTimer by PreferenceDelegateLiveView(
+        EPUB_SLEEP_TIMER, 0, Long::class, ttsTimerLive
+    )
+
+    val ttsTimeRemaining: MutableLiveData<Long?> = MutableLiveData(null)
+
+    val mlFromLanguageLive: MutableLiveData<String> = MutableLiveData(null)
+    var mlFromLanguage by PreferenceDelegateLiveView(
+        EPUB_ML_FROM_LANGUAGE,
+        TranslateLanguage.ENGLISH,
+        String::class,
+        mlFromLanguageLive
+    )
+
+    val mlToLanguageLive: MutableLiveData<String> = MutableLiveData(null)
+    var mlToLanguage by PreferenceDelegateLiveView(
+        EPUB_ML_TO_LANGUAGE,
+        TranslateLanguage.ENGLISH,
+        String::class,
+        mlToLanguageLive
+    )
+
+    // Book specific
+    var mlSettings
+        get() = getKey<MLSettings>(EPUB_CURRENT_ML, book.title()) ?: MLSettings("en", "en")
+        set(value) = setKey(EPUB_CURRENT_ML, book.title(), value)
+
+    data class MLSettings(
+        @JsonProperty("from")
+        val from: String,
+        @JsonProperty("to")
+        val to: String,
+    ) {
+        companion object {
+            val map = mapOf(
+                "af" to "Afrikaans",
+                "ar" to "Arabic",
+                "be" to "Belarusian",
+                "bg" to "Bulgarian",
+                "bn" to "Bengali",
+                "ca" to "Catalan",
+                "cs" to "Czech",
+                "cy" to "Welsh",
+                "da" to "Danish",
+                "de" to "German",
+                "el" to "Greek",
+                "en" to "English",
+                "eo" to "Esperanto",
+                "es" to "Spanish",
+                "et" to "Estonian",
+                "fa" to "Persian",
+                "fi" to "Finnish",
+                "fr" to "French",
+                "ga" to "Irish",
+                "gl" to "Galician",
+                "gu" to "Gujarati",
+                "he" to "Hebrew",
+                "hi" to "Hindi",
+                "hr" to "Croatian",
+                "ht" to "Haitian",
+                "hu" to "Hungarian",
+                "id" to "Indonesian",
+                "is" to "Icelandic",
+                "it" to "Italian",
+                "ja" to "Japanese",
+                "ka" to "Georgian",
+                "kn" to "Kannada",
+                "ko" to "Korean",
+                "lt" to "Lithuanian",
+                "lv" to "Latvian",
+                "mk" to "Macedonian",
+                "mr" to "Marathi",
+                "ms" to "Malay",
+                "mt" to "Maltese",
+                "nl" to "Dutch",
+                "no" to "Norwegian",
+                "pl" to "Polish",
+                "pt" to "Portuguese",
+                "ro" to "Romanian",
+                "ru" to "Russian",
+                "sk" to "Slovak",
+                "sl" to "Slovenian",
+                "sq" to "Albanian",
+                "sv" to "Swedish",
+                "sw" to "Swahili",
+                "ta" to "Tamil",
+                "te" to "Telugu",
+                "th" to "Thai",
+                "tl" to "Tagalog",
+                "tr" to "Turkish",
+                "uk" to "Ukrainian",
+                "ur" to "Urdu",
+                "vi" to "Vietnamese",
+                "zh" to "Chinese",
+            )
+
+            val list = map.toList()
+
+            fun fromShortToDisplay(from: String): String {
+                return map[from] ?: "Unknown"
+            }
+        }
+
+        val fromDisplay get() = fromShortToDisplay(from)
+        val toDisplay get() = fromShortToDisplay(to)
+
+        fun isInvalid(): Boolean = !isValid()
+
+        fun isValid(): Boolean {
+            if (from.isBlank() || to.isBlank()) {
+                // nonsense
+                return false
+            }
+
+            val all = TranslateLanguage.getAllLanguages()
+
+            if (!all.contains(to)) {
+                // no translation
+                return false
+            }
+
+            if (!all.contains(from)) {
+                // no support for auto yet, see https://developers.google.com/ml-kit/language/identification/android
+                return false
+            }
+
+            if (from == to) {
+                // identity function
+                return false
+            }
+
+            return true
+        }
+    }
 }

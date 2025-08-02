@@ -6,14 +6,12 @@ import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.MainActivity.Companion.app
 import com.lagradost.quicknovel.R
-import com.lagradost.quicknovel.STATUS_COMPLETE
-import com.lagradost.quicknovel.STATUS_NULL
-import com.lagradost.quicknovel.STATUS_ONGOING
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.fixUrlNull
 import com.lagradost.quicknovel.newChapterData
 import com.lagradost.quicknovel.newSearchResponse
 import com.lagradost.quicknovel.newStreamResponse
+import com.lagradost.quicknovel.setStatus
 import kotlin.math.roundToInt
 
 open class AllNovelProvider : MainAPI() {
@@ -124,11 +122,22 @@ open class AllNovelProvider : MainAPI() {
 
     override suspend fun loadHtml(url: String): String? {
         val document = app.get(url).document
-        return (document.selectFirst("#chapter-content")
-            ?: document.selectFirst("#chr-content"))?.html()?.replace(
-            " If you find any errors ( broken links, non-standard content, etc.. ), Please let us know &lt; report chapter &gt; so we can fix it as soon as possible.",
-            " "
-        )?.replace("[Updated from F r e e w e b n o v e l. c o m]", "")
+        val content = (document.selectFirst("#chapter-content")
+            ?: document.selectFirst("#chr-content"))
+        if (content == null) return null
+
+        return content.html()
+            .replace(
+                "<iframe .* src=\"//ad.{0,2}-ads.com/.*\" style=\".*\"></iframe>".toRegex(),
+                " "
+            ).replace(
+                " If you find any errors ( broken links, non-standard content, etc.. ), Please let us know &lt; report chapter &gt; so we can fix it as soon as possible.",
+                " "
+            ).replace(
+                "If you find any errors ( Ads popup, ads redirect, broken links, non-standard content, etc.. ), Please let us know &lt; report chapter &gt; so we can fix it as soon as possible.",
+                " "
+            ).replace("[Updated from F r e e w e b n o v e l. c o m]", "")
+
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -185,13 +194,10 @@ open class AllNovelProvider : MainAPI() {
             rating = document.selectFirst("div.small > em > strong:nth-child(1) > span")?.text()
                 ?.toFloatOrNull()?.times(100)?.roundToInt()
 
-            this.status =
-                when (document.selectFirst("div.info > div:nth-child(5) > a")?.selectFirst("a")
-                    ?.text()) {
-                    "Ongoing" -> STATUS_ONGOING
-                    "Completed" -> STATUS_COMPLETE
-                    else -> STATUS_NULL
-                }
+            setStatus(
+                document.selectFirst("div.info > div:nth-child(5) > a")?.selectFirst("a")
+                    ?.text()
+            )
         }
     }
 }

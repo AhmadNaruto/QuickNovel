@@ -2,18 +2,28 @@ package com.lagradost.quicknovel.providers
 
 import android.annotation.SuppressLint
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.quicknovel.*
+import com.lagradost.quicknovel.ErrorLoadingException
+import com.lagradost.quicknovel.HeadMainPageResponse
+import com.lagradost.quicknovel.LoadResponse
+import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.MainActivity.Companion.app
+import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.SearchResponse
+import com.lagradost.quicknovel.UserReview
+import com.lagradost.quicknovel.fixUrlNull
 import com.lagradost.quicknovel.mvvm.logError
+import com.lagradost.quicknovel.mvvm.safe
+import com.lagradost.quicknovel.newChapterData
+import com.lagradost.quicknovel.newSearchResponse
+import com.lagradost.quicknovel.newStreamResponse
+import com.lagradost.quicknovel.setStatus
 import org.jsoup.Jsoup
-import java.lang.Exception
-import java.util.*
-import kotlin.collections.ArrayList
+import java.util.Date
 
 class RoyalRoadProvider : MainAPI() {
     override val name = "Royal Road"
     override val mainUrl = "https://www.royalroad.com"
-
+    override val rateLimitTime = 500L
     override val hasMainPage = true
 
     override val iconId = R.drawable.big_icon_royalroad
@@ -95,8 +105,8 @@ class RoyalRoadProvider : MainAPI() {
         val document = app.get(realUrl).document
         val reviews = document.select("div.reviews-container > div.review")
         return reviews.mapNotNull { r ->
-            val textContent = r?.selectFirst("> div.review-right-content")
-            val scoreContent = r?.selectFirst("> div.review-side")
+            val textContent = r.selectFirst("> div.review-right-content")
+            val scoreContent = r.selectFirst("> div.review-side")
             fun parseScore(data: String?): Int? {
                 return (data?.replace("stars", "")
                     ?.toFloatOrNull()?.times(200))?.toInt()
@@ -195,7 +205,7 @@ class RoyalRoadProvider : MainAPI() {
 
             val reviewContent = textContent?.selectFirst("> div.review-content")
             if (!showSpoilers) reviewContent?.removeClass("spoiler")
-            val reviewTxt = reviewContent?.text()
+            val reviewTxt = reviewContent?.html()
 
             UserReview(
                 reviewTxt ?: return@mapNotNull null,
@@ -261,7 +271,7 @@ class RoyalRoadProvider : MainAPI() {
         val document = Jsoup.parse(response.text)
 
         val returnValue = document.select("div.fiction-list-item").mapNotNull { h ->
-            val head = h?.selectFirst("> div")
+            val head = h.selectFirst("> div")
             val hInfo = head?.selectFirst("> h2.fiction-title > a")
 
             val name = hInfo?.text() ?: return@mapNotNull null
@@ -292,7 +302,7 @@ class RoyalRoadProvider : MainAPI() {
         val document = app.get("$mainUrl/fictions/search?title=$query").document
 
         return document.select("div.fiction-list-item").mapNotNull { h ->
-            val head = h?.selectFirst("> div.search-content")
+            val head = h.selectFirst("> div.search-content")
             val hInfo = head?.selectFirst("> h2.fiction-title > a")
 
             val name = hInfo?.text() ?: return@mapNotNull null
@@ -303,25 +313,24 @@ class RoyalRoadProvider : MainAPI() {
                 rating =
                     head.selectFirst("> div.stats")?.select("> div")?.get(1)?.selectFirst("> span")
                         ?.attr("title")?.toFloatOrNull()?.times(200)?.toInt()
-                latestChapter = h.select("div.stats > div.col-sm-6 > span")[4].text()
+                // latestChapter = h.select("div.stats > div.col-sm-6 > span")[4].text()
             }
         }
     }
 
-    override suspend fun load(url: String): LoadResponse? {
+    override suspend fun load(url: String): LoadResponse {
         val response = app.get(url)
         val document = response.document
-
-        val name = document.selectFirst("h1.font-white")?.text() ?: return null
-
+        val name = document.selectFirst("h1.font-white")?.text()
+            ?: throw ErrorLoadingException("Name not found for '$url'\nmight be deleted or simply a malformed url")
         val fictionId =
             response.text.substringAfter("window.fictionId = ").substringBefore(";").toIntOrNull()
 
         val chapterHeaders = document.select("div.portlet-body > table > tbody > tr")
         val data = chapterHeaders.mapNotNull { c ->
-            val cUrl = c?.attr("data-url") ?: return@mapNotNull null
+            val cUrl = c.attr("data-url") ?: return@mapNotNull null
             val td = c.select("> td") // 0 = Name, 1 = Upload
-            val cName = td[0].selectFirst("> a")?.text() ?: return@mapNotNull null
+            val cName = td.getOrNull(0)?.selectFirst("> a")?.text() ?: return@mapNotNull null
 
             newChapterData(name = cName, url = cUrl) {
                 dateOfRelease = td[1].selectFirst("> a > time")?.text()
@@ -334,21 +343,13 @@ class RoyalRoadProvider : MainAPI() {
             val statusTxt = document.select("div.col-md-8 > div.margin-bottom-10 > span.label")
             for (s in statusTxt) {
                 if (s.hasText()) {
-                    status = when (s.text()) {
-                        "ONGOING" -> STATUS_ONGOING
-                        "COMPLETED" -> STATUS_COMPLETE
-                        "HIATUS" -> STATUS_PAUSE
-                        "STUB" -> STATUS_DROPPED
-                        "DROPPED" -> STATUS_DROPPED
-                        else -> continue
-                    }
-                    break
+                    if (setStatus(s.text())) break
                 }
             }
 
             val hStates = document.select("ul.list-unstyled")[1]
             val stats = hStates.select("> li")
-            views = stats[1]?.text()?.replace(",", "")?.replace(".", "")?.toInt()
+            views = stats.getOrNull(1)?.text()?.replace(",", "")?.replace(".", "")?.toInt()
             posterUrl =
                 document.selectFirst("div.fic-header > div > .cover-art-container > img")
                     ?.attr("src")
@@ -363,8 +364,10 @@ class RoyalRoadProvider : MainAPI() {
             author = document.selectFirst("h4.font-white > span > a")?.text()
             val ratingAttr = document.selectFirst("span.font-red-sunglo")?.attr("data-content")
             tags = document.select("span.tags > a").map { it.text() }
-            rating =
-                (ratingAttr?.substring(0, ratingAttr.indexOf('/'))?.toFloat()?.times(200))?.toInt()
+            safe {
+                rating =
+                    (ratingAttr?.substring(0, ratingAttr.indexOf('/'))?.toFloat()?.times(200))?.toInt()
+            }
         }
     }
 

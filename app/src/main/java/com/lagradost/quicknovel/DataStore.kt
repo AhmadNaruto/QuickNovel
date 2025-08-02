@@ -8,11 +8,13 @@ import com.fasterxml.jackson.databind.json.JsonMapper
 import com.fasterxml.jackson.module.kotlin.KotlinFeature
 import com.fasterxml.jackson.module.kotlin.KotlinModule
 import com.lagradost.quicknovel.mvvm.logError
+import androidx.core.content.edit
 
 const val PREFERENCES_NAME: String = "rebuild_preference"
 const val DOWNLOAD_FOLDER: String = "downloads_data"
 const val DOWNLOAD_SIZE: String = "downloads_size"
 const val DOWNLOAD_TOTAL: String = "downloads_total"
+const val DOWNLOAD_OFFSET: String = "downloads_offset"
 const val DOWNLOAD_EPUB_SIZE: String = "downloads_epub_size"
 const val DOWNLOAD_EPUB_LAST_ACCESS: String = "downloads_epub_last_access"
 const val DOWNLOAD_SORTING_METHOD: String = "download_sorting"
@@ -21,6 +23,7 @@ const val DOWNLOAD_SETTINGS: String = "download_settings"
 const val EPUB_LOCK_ROTATION: String = "reader_epub_rotation"
 const val EPUB_TEXT_SIZE: String = "reader_epub_text_size"
 const val EPUB_TEXT_BIONIC: String = "reader_epub_bionic_reading"
+const val EPUB_TEXT_SELECTABLE: String = "reader_epub_text_selectable"
 const val EPUB_SCROLL_VOL: String = "reader_epub_scroll_volume"
 const val EPUB_TTS_LOCK: String = "reader_epub_scroll_lock"
 const val EPUB_BG_COLOR: String = "reader_epub_bg_color"
@@ -29,6 +32,9 @@ const val EPUB_TEXT_PADDING: String = "reader_epub_text_padding"
 const val EPUB_TEXT_PADDING_TOP: String = "reader_epub_text_padding_top"
 const val EPUB_HAS_BATTERY: String = "reader_epub_has_battery"
 const val EPUB_KEEP_SCREEN_ACTIVE: String = "reader_epub_keep_screen_active"
+const val EPUB_SLEEP_TIMER: String = "reader_epub_tts_timer"
+const val EPUB_ML_FROM_LANGUAGE: String = "reader_epub_ml_from"
+const val EPUB_ML_TO_LANGUAGE: String = "reader_epub_ml_to"
 const val EPUB_HAS_TIME: String = "reader_epub_has_time"
 const val EPUB_TWELVE_HOUR_TIME: String = "reader_epub_twelve_hour_time"
 const val EPUB_FONT: String = "reader_epub_font"
@@ -38,12 +44,55 @@ const val EPUB_READER_TYPE: String = "reader_reader_type"
 const val EPUB_CURRENT_POSITION: String = "reader_epub_position"
 const val EPUB_CURRENT_POSITION_SCROLL: String = "reader_epub_position_scroll"
 const val EPUB_CURRENT_POSITION_SCROLL_CHAR: String = "reader_epub_position_scroll_char"
+const val EPUB_CURRENT_ML: String = "reader_epub_ml"
 const val EPUB_CURRENT_POSITION_READ_AT: String = "reader_epub_position_read"
+const val EPUB_CURRENT_POSITION_CHAPTER: String = "reader_epub_position_chapter"
 const val RESULT_BOOKMARK: String = "result_bookmarked"
 const val RESULT_BOOKMARK_STATE: String = "result_bookmarked_state"
 const val HISTORY_FOLDER: String = "result_history"
+const val CURRENT_TAB : String = "current_tab"
+
+/** When inserting many keys use this function, this is because apply for every key is very expensive on memory */
+data class Editor(
+    val editor : SharedPreferences.Editor
+) {
+    /** Always remember to call apply after */
+    fun<T> setKeyRaw(path: String, value: T) {
+        @Suppress("UNCHECKED_CAST")
+        if (isStringSet(value)) {
+            editor.putStringSet(path, value as Set<String>)
+        } else {
+            when (value) {
+                is Boolean -> editor.putBoolean(path, value)
+                is Int -> editor.putInt(path, value)
+                is String -> editor.putString(path, value)
+                is Float -> editor.putFloat(path, value)
+                is Long -> editor.putLong(path, value)
+            }
+        }
+    }
+
+    private fun isStringSet(value: Any?) : Boolean {
+        if (value is Set<*>) {
+            return value.filterIsInstance<String>().size == value.size
+        }
+        return false
+    }
+
+    fun apply() {
+        editor.apply()
+        System.gc()
+    }
+}
 
 object DataStore {
+
+    fun editor(context : Context, isEditingAppSettings: Boolean = false) : Editor {
+        val editor: SharedPreferences.Editor =
+            if (isEditingAppSettings) context.getDefaultSharedPrefs().edit() else context.getSharedPrefs().edit()
+        return Editor(editor)
+    }
+
     val mapper: JsonMapper = JsonMapper.builder().addModule(
         KotlinModule.Builder()
             .withReflectionCacheSize(512)
@@ -66,24 +115,6 @@ object DataStore {
 
     fun getFolderName(folder: String, path: String): String {
         return "${folder}/${path}"
-    }
-
-    fun <T> Context.setKeyRaw(path: String, value: T, isEditingAppSettings: Boolean = false) {
-        try {
-            val editor: SharedPreferences.Editor =
-                if (isEditingAppSettings) getDefaultSharedPrefs().edit() else getSharedPrefs().edit()
-            when (value) {
-                is Boolean -> editor.putBoolean(path, value)
-                is Int -> editor.putInt(path, value)
-                is String -> editor.putString(path, value)
-                is Float -> editor.putFloat(path, value)
-                is Long -> editor.putLong(path, value)
-                (value as? Set<String> != null) -> editor.putStringSet(path, value as Set<String>)
-            }
-            editor.apply()
-        } catch (e: Exception) {
-            logError(e)
-        }
     }
 
     fun Context.getDefaultSharedPrefs(): SharedPreferences {
@@ -130,9 +161,9 @@ object DataStore {
 
     fun <T> Context.setKey(path: String, value: T) {
         try {
-            val editor: SharedPreferences.Editor = getSharedPrefs().edit()
-            editor.putString(path, mapper.writeValueAsString(value))
-            editor.apply()
+            getSharedPrefs().edit {
+                putString(path, mapper.writeValueAsString(value))
+            }
         } catch (e: Exception) {
             logError(e)
         }

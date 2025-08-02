@@ -1,11 +1,14 @@
 package com.lagradost.quicknovel
 
+import androidx.annotation.StringRes
 import androidx.annotation.WorkerThread
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.nicehttp.NiceResponse
 import com.lagradost.quicknovel.MainActivity.Companion.app
 import com.lagradost.quicknovel.mvvm.logError
 import com.lagradost.quicknovel.ui.UiImage
 import com.lagradost.quicknovel.ui.img
+import kotlinx.coroutines.sync.Mutex
 import org.jsoup.Jsoup
 
 const val USER_AGENT =
@@ -18,6 +21,8 @@ abstract class MainAPI {
     open val lang = "en" // ISO_639_1 check SubtitleHelper
 
     open val rateLimitTime: Long = 0
+    val hasRateLimit: Boolean get() = rateLimitTime > 0L
+    val rateLimitMutex: Mutex = Mutex()
 
     open val usesCloudFlareKiller = false
 
@@ -193,11 +198,28 @@ fun MainAPI.newSearchResponse(
     return builder
 }
 
-const val STATUS_NULL = 0
-const val STATUS_ONGOING = 1
-const val STATUS_COMPLETE = 2
-const val STATUS_PAUSE = 3
-const val STATUS_DROPPED = 4
+enum class ReleaseStatus(@StringRes val resource: Int) {
+    Ongoing(R.string.ongoing),
+    Completed(R.string.completed),
+    Paused(R.string.paused),
+    Dropped(R.string.dropped),
+    Stubbed(R.string.stubbed),
+}
+
+fun LoadResponse.setStatus(status: String?): Boolean {
+    if (status == null) {
+        return false
+    }
+    this.status = when (status.lowercase().trim()) {
+        "ongoing", "on-going", "on_going" -> ReleaseStatus.Ongoing
+        "completed", "complete", "done" -> ReleaseStatus.Completed
+        "hiatus", "paused", "pause" -> ReleaseStatus.Paused
+        "dropped", "drop" -> ReleaseStatus.Dropped
+        "stub", "stubbed" -> ReleaseStatus.Stubbed
+        else -> return false
+    }
+    return true
+}
 
 interface LoadResponse {
     val url: String
@@ -211,12 +233,12 @@ interface LoadResponse {
     var views: Int?
     var synopsis: String?
     var tags: List<String>?
-    var status: Int? // 0 = null - implemented but not found, 1 = Ongoing, 2 = Complete, 3 = Pause/HIATUS, 4 = Dropped
+    var status: ReleaseStatus? // 0 = null - implemented but not found, 1 = Ongoing, 2 = Complete, 3 = Pause/HIATUS, 4 = Dropped
     var posterHeaders: Map<String, String>?
 
     val image: UiImage? get() = img(url = posterUrl, headers = posterHeaders)
     val apiName: String
-    var related : List<SearchResponse>?
+    var related: List<SearchResponse>?
 }
 
 data class StreamResponse(
@@ -231,7 +253,7 @@ data class StreamResponse(
     override var views: Int? = null,
     override var synopsis: String? = null,
     override var tags: List<String>? = null,
-    override var status: Int? = null,
+    override var status: ReleaseStatus? = null,
     override var posterHeaders: Map<String, String>? = null,
     var nextChapter: ChapterData? = null,
     override var related: List<SearchResponse>? = null
@@ -304,9 +326,10 @@ data class EpubResponse(
     override var views: Int? = null,
     override var synopsis: String? = null,
     override var tags: List<String>? = null,
-    override var status: Int? = null,
+    override var status: ReleaseStatus? = null,
     override var posterHeaders: Map<String, String>? = null,
-    val links: List<DownloadLinkType>,
+    var downloadLinks: List<DownloadLink>,
+    var downloadExtractLinks: List<DownloadExtractLink>,
     override val apiName: String,
     override var related: List<SearchResponse>? = null
 ) : LoadResponse
@@ -322,7 +345,8 @@ suspend fun MainAPI.newEpubResponse(
         name = name,
         url = if (fix) fixUrl(url) else url,
         apiName = this.name,
-        links = links
+        downloadLinks = links.filterIsInstance<DownloadLink>().toList(),
+        downloadExtractLinks = links.filterIsInstance<DownloadExtractLink>().toList()
     )
     builder.initializer()
 

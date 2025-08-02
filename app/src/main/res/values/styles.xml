@@ -1,6 +1,9 @@
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="AppTheme" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Opt out of edgeToEdge enforcement in >= Android 15 -->
+        <item name="android:windowOptOutEdgeToEdgeEnforcement" tools:targetApi="35">true</item>
+
         <item name="android:windowBackground">@drawable/splash_background</item>
         <item name="android:navigationBarColor">?attr/primaryBlackBackground</item>
         <item name="android:colorEdgeEffect">?attr/textColor</item>
@@ -59,6 +62,12 @@
         <item name="boxItemBackground">@color/boxItemBackground</item>
         <item name="iconColor">?attr/textColor</item>
         <item name="white">#FFF</item>
+
+        <!-- Checkboxes
+        <item name="colorControlNormal">?attr/white</item>
+        <item name="colorControlActivated">?attr/white</item>
+        <item name="colorControlHighlight">?attr/white</item>
+         -->
     </style>
 
     <style name="TabNoCaps" parent="TextAppearance.Design.Tab">
@@ -308,6 +317,16 @@
         <item name="iconTint">?attr/textColor</item>
         <item name="android:textColor">?attr/textColor</item>
         <item name="rippleColor">?attr/textColor</item>
+    </style>
+
+    <style name="WhiteCheckmark">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">16sp</item>
+        <item name="textColor">?attr/textColor</item>
+        <item name="android:layout_marginStart">0dp</item>
+        <item name="buttonTint">?attr/white</item>
+        <item name="buttonIconTint">?attr/primaryBlackBackground</item>
     </style>
 
     <style name="AppTextViewStyle" parent="android:Widget.TextView">

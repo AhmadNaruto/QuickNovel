@@ -13,7 +13,6 @@ import android.widget.TextView
 import androidx.core.text.getSpans
 import androidx.core.view.isVisible
 import androidx.recyclerview.widget.DiffUtil
-import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewbinding.ViewBinding
 import com.lagradost.quicknovel.ChapterLoadSpanned
@@ -173,8 +172,9 @@ data class TextConfig(
     val textSize: Int,
     val textFont: String,
     val defaultFont: Typeface,
-    val backgroundColor : Int,
-    val bionicReading : Boolean
+    val backgroundColor: Int,
+    val bionicReading: Boolean,
+    val isTextSelectable: Boolean,
 ) {
     private val fontFile: File? by lazy {
         if (textFont == "") null else systemFonts.firstOrNull { it.name == textFont }
@@ -207,9 +207,11 @@ data class TextConfig(
     private fun setTextColor(textView: TextView) {
         textView.setTextColor(textColor)
     }
+
     private fun setBgTextColor(textView: TextView) {
         textView.setTextColor(backgroundColor)
     }
+
     fun setArgs(progressBar: ProgressBar) {
         progressBar.progressTintList = ColorStateList.valueOf(textColor)
         progressBar.indeterminateTintList = ColorStateList.valueOf(textColor)
@@ -242,8 +244,11 @@ data class TextConfig(
     }
 }
 
-class TextAdapter(private val viewModel: ReadActivityViewModel, var config: TextConfig) :
-    ListAdapter<SpanDisplay, TextAdapter.TextAdapterHolder>(DiffCallback()) {
+class TextAdapter(
+    private val viewModel: ReadActivityViewModel,
+    var config: TextConfig
+) :
+    NoStateAdapter<SpanDisplay>(DiffCallback()) {
     private var currentTTSLine: TTSHelper.TTSLine? = null
 
     fun changeHeight(height: Int): Boolean {
@@ -252,7 +257,7 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
         return true
     }
 
-    fun changeBionicReading(to : Boolean) : Boolean {
+    fun changeBionicReading(to: Boolean): Boolean {
         if (config.bionicReading == to) return false
         config = config.copy(bionicReading = to)
         return true
@@ -282,7 +287,16 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
         return true
     }
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): TextAdapterHolder {
+    fun changeTextSelectable(isTextSelectable: Boolean): Boolean {
+        if (config.isTextSelectable == isTextSelectable) return false
+        config = config.copy(isTextSelectable = isTextSelectable)
+        return true
+    }
+
+    override fun onCreateCustom(
+        parent: ViewGroup,
+        viewType: Int
+    ): TextAdapterHolder {
         val inflater = LayoutInflater.from(parent.context)
         val binding: ViewBinding = when (viewType) {
             DRAW_TEXT -> SingleTextBinding.inflate(inflater, parent, false)
@@ -291,7 +305,7 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
             DRAW_FAILED -> SingleFailedBinding.inflate(inflater, parent, false)
             DRAW_CHAPTER -> SingleFinishedChapterBinding.inflate(inflater, parent, false)
             DRAW_LOAD -> SingleLoadBinding.inflate(inflater, parent, false)
-            DRAW_OVERSCROLL -> SingleOverscrollChapterBinding.inflate(inflater,parent,false)
+            DRAW_OVERSCROLL -> SingleOverscrollChapterBinding.inflate(inflater, parent, false)
             else -> throw NotImplementedError()
         }
 
@@ -437,13 +451,15 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
         )
     }*/
 
-    override fun onBindViewHolder(holder: TextAdapterHolder, position: Int) {
+    override fun onBindContent(holder: ViewHolderState<Nothing>, item: SpanDisplay, position: Int) {
         val currentItem = getItem(position)
-        holder.bind(currentItem, currentTTSLine, config)
+        when (holder) {
+            is TextAdapterHolder -> holder.bind(currentItem, currentTTSLine, config)
+        }
     }
 
-    override fun getItemViewType(position: Int): Int {
-        return when (val item = getItem(position)) {
+    override fun getItemViewTypeCustom(item: Any): Int {
+        return when (item) {
             is TextSpan -> {
                 if (item.text.getSpans<AsyncDrawableSpan>(0, item.text.length).isNotEmpty()) {
                     DRAW_DRAWABLE
@@ -467,9 +483,11 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
             is ChapterLoadSpanned -> {
                 DRAW_LOAD
             }
+
             is ChapterOverscrollSpanned -> {
                 DRAW_OVERSCROLL
             }
+
             else -> throw NotImplementedError()
         }
     }
@@ -482,14 +500,17 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
         val binding: ViewBinding,
         private val viewModel: ReadActivityViewModel,
     ) :
-        RecyclerView.ViewHolder(binding.root) {
+        ViewHolderState<Nothing>(binding) {
 
         var span: SpanDisplay? = null
 
         private fun setConfig(config: TextConfig) {
             when (binding) {
                 is SingleTextBinding -> {
-                    config.setArgs(binding.root, CONFIG_SIZE or CONFIG_COLOR or CONFIG_FONT)
+                    config.setArgs(
+                        binding.root,
+                        CONFIG_SIZE or CONFIG_COLOR or CONFIG_FONT
+                    )
                 }
 
                 is SingleLoadingBinding -> {
@@ -547,7 +568,7 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
         }
 
 
-        private fun bindImage(binding : SingleImageBinding, img : AsyncDrawable) {
+        private fun bindImage(binding: SingleImageBinding, img: AsyncDrawable) {
             val url = img.destination
             if (binding.root.url == url) return
             binding.root.url = url // don't reload if already set
@@ -558,13 +579,13 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
             when (binding) {
                 is SingleImageBinding -> {
                     val img = obj.text.getSpans<AsyncDrawableSpan>(0, obj.text.length)[0]
-                    bindImage(binding,img.drawable)
+                    bindImage(binding, img.drawable)
 
                     binding.root.setOnClickListener { root ->
                         if (root !is TextImageView) {
                             return@setOnClickListener
                         }
-                        showImage(root.context,img.drawable)
+                        showImage(root.context, img.drawable)
                     }
 
                     /*val size = 300.toPx
@@ -592,21 +613,33 @@ class TextAdapter(private val viewModel: ReadActivityViewModel, var config: Text
                 is SingleTextBinding -> {
                     binding.root.apply {
                         // this is set to fix the nonclick https://stackoverflow.com/questions/8641343/android-clickablespan-not-calling-onclick
-                        movementMethod = LinkMovementMethod.getInstance()
                         text = if (config.bionicReading) {
                             obj.bionicText
                         } else {
                             obj.text
                         }
 
+                        setTextIsSelectable(false) // this is so retarded
+
+                        // https://stackoverflow.com/questions/36801486/androidtextisselectable-true-not-working-for-textview-in-recyclerview
+                        if (config.isTextSelectable) {
+                            post {
+                                setTextIsSelectable(true)
+                                movementMethod = LinkMovementMethod.getInstance()
+                                setOnClickListener {
+                                    viewModel.switchVisibility()
+                                }
+                            }
+                        } else {
+                            movementMethod = LinkMovementMethod.getInstance()
+                            setOnClickListener {
+                                viewModel.switchVisibility()
+                            }
+                        }
                         //val links = obj.text.getSpans<io.noties.markwon.core.spans.LinkSpan>()
                         //if (links.isNotEmpty()) {
                         //   println("URLS: ${links.size} : ${links.map { it.url }}")
                         //}
-
-                        setOnClickListener {
-                            viewModel.switchVisibility()
-                        }
                     }
                 }
 

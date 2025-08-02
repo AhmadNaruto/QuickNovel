@@ -3,6 +3,7 @@ package com.lagradost.quicknovel
 import android.app.Activity
 import android.content.Intent
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
@@ -19,13 +20,10 @@ import androidx.navigation.NavDestination
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavOptions
-import androidx.navigation.findNavController
 import androidx.navigation.fragment.NavHostFragment
 import androidx.preference.PreferenceManager
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.json.JsonMapper
-import com.fasterxml.jackson.module.kotlin.KotlinModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -39,6 +37,7 @@ import com.lagradost.quicknovel.BookDownloader2Helper.createQuickStream
 import com.lagradost.quicknovel.BookDownloader2Helper.requestRW
 import com.lagradost.quicknovel.CommonActivity.activity
 import com.lagradost.quicknovel.CommonActivity.showToast
+import com.lagradost.quicknovel.CommonActivity.updateLocale
 import com.lagradost.quicknovel.DataStore.getKey
 import com.lagradost.quicknovel.DataStore.getKeys
 import com.lagradost.quicknovel.NotificationHelper.requestNotifications
@@ -51,7 +50,6 @@ import com.lagradost.quicknovel.mvvm.observeNullable
 import com.lagradost.quicknovel.providers.RedditProvider
 import com.lagradost.quicknovel.ui.ReadType
 import com.lagradost.quicknovel.ui.download.DownloadFragment
-import com.lagradost.quicknovel.ui.mainpage.MainPageFragment
 import com.lagradost.quicknovel.ui.result.ResultFragment
 import com.lagradost.quicknovel.ui.result.ResultViewModel
 import com.lagradost.quicknovel.ui.search.SearchFragment
@@ -80,9 +78,6 @@ import kotlin.reflect.KClass
 
 class MainActivity : AppCompatActivity() {
     companion object {
-        private val mapper = JsonMapper.builder().addModule(KotlinModule())
-            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false).build()!!
-
         private var _mainActivity: WeakReference<MainActivity>? = null
         private var mainActivity
             get() = _mainActivity?.get()
@@ -175,12 +170,12 @@ class MainActivity : AppCompatActivity() {
             (this as AppCompatActivity?)?.loadResult(card.url, card.apiName, startAction)
         }
 
-        fun AppCompatActivity.loadResultFromUrl(url: String?) {
-            if (url == null) return
+        fun AppCompatActivity.loadResultFromUrl(url: String?): Boolean {
+            if (url == null) return false
             for (api in apis) {
                 if (url.contains(api.mainUrl)) {
                     loadResult(url, api.name)
-                    break
+                    return false
                 }
             }
 
@@ -207,7 +202,9 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     logError(e)
                 }
+                return true
             }
+            return false
         }
 
         /*fun AppCompatActivity.backPressed(): Boolean {
@@ -376,7 +373,7 @@ class MainActivity : AppCompatActivity() {
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
         if (intent.action == Intent.ACTION_SEND) {
-            val extraText = try { // I dont trust android
+            val extraText = try { // I don't trust android
                 intent.getStringExtra(Intent.EXTRA_TEXT)
             } catch (e: Exception) {
                 null
@@ -386,13 +383,15 @@ class MainActivity : AppCompatActivity() {
             val url = item?.text?.toString()
 
             // idk what I am doing, just hope any of these work
-            if (item?.uri != null)
-                loadResultFromUrl(item.uri?.toString())
-            else if (url != null)
-                loadResultFromUrl(url)
-            else if (extraText != null)
-                loadResultFromUrl(extraText)
-
+            if (item?.uri != null && loadResultFromUrl(item.uri?.toString())) {
+                return
+            }
+            if (url != null && loadResultFromUrl(url)) {
+                return
+            }
+            if (extraText != null && loadResultFromUrl(extraText)) {
+                return
+            }
         }
         val data: String? = intent.data?.toString()
         loadResultFromUrl(data)
@@ -421,15 +420,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        updateLocale() // android fucks me by chaining lang when rotating the phone
+    }
+
     var binding: ActivityMainBinding? = null
     override fun onCreate(savedInstanceState: Bundle?) {
         mainActivity = this
-        activity = this
 
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
 
         val settingsManager = PreferenceManager.getDefaultSharedPreferences(this)
         CommonActivity.loadThemes(this)
+        CommonActivity.init(this)
 
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -554,7 +558,7 @@ class MainActivity : AppCompatActivity() {
 
                         bookmark.setOnClickListener { view ->
                             view.popupMenu(
-                                ReadType.values().map { it.prefValue to it.stringRes },
+                                ReadType.entries.map { it.prefValue to it.stringRes },
                                 selectedItemId = viewModel.readState.value?.prefValue
                             ) {
                                 viewModel.bookmark(itemId)
@@ -603,13 +607,7 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         resultviewPreviewMetaStatus.apply {
-                            val statusTxt = when (d.status) {
-                                1 -> getString(R.string.ongoing)
-                                2 -> getString(R.string.completed)
-                                3 -> getString(R.string.paused)
-                                4 -> getString(R.string.dropped)
-                                else -> ""
-                            }
+                            val statusTxt = d.status?.resource?.let { getString(it) } ?: ""
 
                             resultviewPreviewMetaStatus.text = statusTxt
                             resultviewPreviewMetaStatus.isVisible = statusTxt.isNotBlank()
@@ -673,7 +671,7 @@ class MainActivity : AppCompatActivity() {
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
                     window?.navigationBarColor = colorFromAttribute(R.attr.primaryGrayBackground)
-                    //updateLocale()
+                    updateLocale()
 
                     // If we don't disable we end up in a loop with default behavior calling
                     // this callback as well, so we disable it, run default behavior,
